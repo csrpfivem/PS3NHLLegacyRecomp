@@ -1,0 +1,68 @@
+# Generated from the game (never commit: this is the game's code)
+nhl/port/recompiled/
+nhl/port/recompiled_*/
+nhl/port/spu/
+nhl/port/spu_avx2/
+
+# Game files and anything extracted or decrypted from them
+*.iso
+*.pkg
+*.elf
+*.self
+*.sprx
+*.prx
+EBOOT.BIN
+*.sdat
+*.edat
+*.big
+*.vp6
+bin/
+game/
+data/
+nhl/vfs/
+nhl/hdd0/
+nhl/edat_cache/
+nhl/movies/
+nhl/carved/
+nhl/out/
+nhl/install_test/
+recon/
+
+# Build output
+nhl/build*/
+build/
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+*.map
+*.profraw
+
+# Local toolchain and environments
+toolchain/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Run output, captures, saves, settings
+nhl/runs/
+runs/
+logs/
+user/
+mods/
+nhl_settings.ini
+*.log
+*.dbg.txt
+
+# Backups
+*.pre[0-9]*
+*.hx[0-9]*
+*.bak
+*.orig
+
+# The ps3recomp test fixture is a tiny synthetic SPU ELF, not game data
+!ps3recomp/ps3recomp-master/runtime/spu/tests/test_reloc.elf

@@ -1,0 +1,6 @@
+#include "resource.h"
+
+IDR_FONT_BODY RCDATA "third_party/fonts/Archivo-Regular.ttf"
+IDR_FONT_BODY_B RCDATA "third_party/fonts/Archivo-SemiBold.ttf"
+IDR_FONT_HEAD RCDATA "third_party/fonts/BigShouldersDisplay-Bold.ttf"
+IDR_FONT_HEAD_X RCDATA "third_party/fonts/BigShouldersDisplay-ExtraBold.ttf"
