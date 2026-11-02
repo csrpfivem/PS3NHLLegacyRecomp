@@ -19,6 +19,8 @@ As a note this port was developed for about two weeks (Oct 17 - Nov 1 2026) usin
 was built on sp00nznet's ps3recomp toolkit with about 300 logged fixes and changes, many of them 
 from bugs I (HeckYouMan) found while play-testing
 
+Join our discord! https://discord.gg/UU9bpt4Qmx
+
 ---
 
 ## Features
