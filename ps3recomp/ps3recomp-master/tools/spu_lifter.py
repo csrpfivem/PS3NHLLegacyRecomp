@@ -158,6 +158,9 @@ static inline void spu_wrch_inl(spu_context* ctx, uint32_t ch, u128 v)
     case MFC_EAL:   ctx->mfc_eal  = v._u32[0]; return;
     case MFC_Size:  ctx->mfc_size = v._u32[0]; return;
     case MFC_TagID: ctx->mfc_tag  = v._u32[0] & 0x1F; return;
+    /* [NHL local patch #311] the tag wait after every transfer: DMA is synchronous, so the update is "completed tags & mask"; mfc_tag_pending mirrors ~mfc->tag_completed (spu_dma.h). The tag-event producer (event mask bit 0) keeps the real function. */
+    case MFC_WrTagMask: ctx->mfc_tag_mask = v._u32[0]; return;
+    case MFC_WrTagUpdate: if (__builtin_expect(v._u32[0] != 0 && (ctx->event_mask & 0x1u), 0)) { spu_wrch(ctx, ch, v); return; } ctx->mfc_tag_status = ~ctx->mfc_tag_pending & ctx->mfc_tag_mask; return;
     default:        spu_wrch(ctx, ch, v); return;
     }
 }

@@ -189,10 +189,14 @@ endif()
 add_executable(${PROJECT_NAME}
     boot_main.cpp   # ps3recomp's instrumented harness (watchdog, PS3_DEBUG console, sampler)
     nhl_hle.cpp     # NHL: port-specific HLE handlers
+    nhl_usermusic.cpp  # NHL: user music library + decode (cellSearch / cellMusicDecode2, #316)
     nhl_config.cpp  # NHL: nhl_settings.ini + built-in run defaults (#221)
     nhl_vp6_bridge.cpp  # NHL: host-decode (ffmpeg) bridge for the VP6 movies
     nhl_edge.c      # NHL: Edge Geometry job recon (#268)
     nhl_edge_native.c  # NHL: native Edge decompress + skin + compress (#292)
+    nhl_eal3.c      # NHL: EALayer3 decoder job recon + corpus capture (#304)
+    nhl_eal3_native.c  # NHL: native EALayer3 IMDCT + synthesis (#305)
+    nhl_cmdscan.c   # NHL: native table scan in the eacgfx command dispatch job (#307)
     stubs.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
@@ -283,9 +287,9 @@ if(SPU_SOURCES)
 endif()
 
 if(MSVC)
-    set_source_files_properties(nhl_edge_native.c PROPERTIES COMPILE_OPTIONS "-O2;/arch:AVX2;/GS-")   # #292: intrinsics, AVX2 is the minimum CPU
+    set_source_files_properties(nhl_edge_native.c nhl_eal3_native.c PROPERTIES COMPILE_OPTIONS "-O2;/arch:AVX2;/GS-")   # #292 / #305: AVX2 is the minimum CPU
 else()
-    set_source_files_properties(nhl_edge_native.c PROPERTIES COMPILE_OPTIONS "-O2;-march=x86-64-v3;-fno-stack-protector")
+    set_source_files_properties(nhl_edge_native.c nhl_eal3_native.c PROPERTIES COMPILE_OPTIONS "-O2;-march=x86-64-v3;-fno-stack-protector")
 endif()
 
 # app.rc carries the icon, the version block and the manifest, and needs a
@@ -293,6 +297,11 @@ endif()
 # link error, it is a "no rule to make" for a file nothing can consume.
 if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
     target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
+    # #317: app.rc embeds app.manifest (asInvoker + UTF-8 code page); stop the
+    # linker adding its own default one, or the two RT_MANIFEST #1 collide.
+    if(MSVC)
+        target_link_options(${PROJECT_NAME} PRIVATE "/MANIFEST:NO")
+    endif()
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE

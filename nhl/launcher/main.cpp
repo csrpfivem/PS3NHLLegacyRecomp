@@ -25,9 +25,11 @@
 #include "imgui_internal.h"
 #include "backends/imgui_impl_dx11.h"
 #include "backends/imgui_impl_win32.h"
+#include "audio_pack.h"
 #include "bug_report.h"
 #include "ini.h"
 #include "installer.h"
+#include "trax.h"
 #include "iso9660.h"
 #include "pkg.h"
 #include "ui.h"
@@ -232,6 +234,7 @@ struct App {
     bool no_crowd = false;    // [video] no_crowd = 2 (#295)
     bool ice_bounce = true;   // [video] ice_bounce = 0 turns it off (#298)
     bool skip_intro = false;  // [game] skip_intro = 1 (#297)
+    int um_gain = 2;          // #320: index into kUmGain ([game] usermusic_gain, dB)
     int msaa = 2;            // index into kMsaa (#249)
     int aniso = 4;            // index into kAniso (#252)
     int rscale = 0;           // index into kScale (#253)
@@ -239,6 +242,7 @@ struct App {
     std::string status;       // home-screen message
     bool crashed = false;     // status is about a game crash: offer the report
     std::string last_log;     // err log of the latest run
+    std::string trax_err;     // #318: why the EA Trax songs could not be added at the last PLAY
     bool game_running = false;
     std::vector<ModInfo> mods;
     std::string roster;   // active roster source (#257), "" = your own
@@ -250,6 +254,52 @@ struct App {
     std::mutex report_m;
     std::string report_msg;
     std::wstring report_zip;
+    // #321 audio packs: export / import on a worker (a pack is all the music files)
+    std::thread audio_worker;
+    std::atomic<bool> audio_busy{ false };
+    std::mutex audio_m;
+    std::string audio_msg;            // guarded by audio_m
+    bool audio_failed = false;        // guarded by audio_m
+    std::wstring audio_file;          // guarded by audio_m: the pack just written
+    // the "Make audio pack" chooser (UI thread only)
+    bool pack_choose = false;
+    AudioPackScan pack_scan;
+    std::vector<char> pack_pick;      // per pack_scan.items
+    bool pack_table = true;
+
+    // export = true: write a pack of the music folders in 'packs' (L"" = loose songs),
+    // with the Custom Audio choices if with_table; else install the pack files in 'packs'.
+    void audio_job(bool do_export, std::vector<std::wstring> packs, bool with_table = true)
+    {
+        if (audio_busy) return;
+        if (audio_worker.joinable()) audio_worker.join();
+        audio_busy = true;
+        {
+            std::lock_guard<std::mutex> l(audio_m);
+            audio_msg = do_export ? "Packing your music and Custom Audio setup..." : "Installing the audio pack...";
+            audio_failed = false;
+            audio_file.clear();
+        }
+        audio_worker = std::thread([this, do_export, with_table, packs = std::move(packs), dir = install.wstring()] {
+            std::string msg, err;
+            std::wstring file;
+            if (do_export) {
+                err = export_audio_pack(dir, packs, with_table, &file, &msg);
+            } else {
+                for (const std::wstring& p : packs) {
+                    std::string s;
+                    const std::string e = import_audio_pack(dir, p, &s);
+                    if (!e.empty()) { err = narrow(fs::path(p).filename().wstring()) + ": " + e; break; }
+                    msg += (msg.empty() ? "" : " ") + s;
+                }
+            }
+            std::lock_guard<std::mutex> l(audio_m);
+            audio_failed = !err.empty();
+            audio_msg = err.empty() ? msg : (do_export ? "Could not make the audio pack: " : "Could not install: ") + err;
+            audio_file = file;
+            audio_busy = false;
+        });
+    }
     // Mod installs (drops, Install mod...): one batch at a time on a worker
     std::thread mod_worker;
     std::atomic<bool> mod_busy{ false }, mod_done{ false }, mod_cancel{ false };
@@ -299,6 +349,8 @@ struct App {
         no_crowd = ini.get("video", "no_crowd", "0") != "0";
         ice_bounce = ini.get("video", "ice_bounce", "1") != "0";
         skip_intro = ini.get("game", "skip_intro", "0") == "1";
+        { const int g = atoi(ini.get("game", "usermusic_gain", "12").c_str());
+          um_gain = g >= 18 ? 3 : g >= 12 ? 2 : g >= 6 ? 1 : 0; }
         { const int s = atoi(ini.get("video", "msaa", "4").c_str());
           msaa = s >= 8 ? 3 : s >= 4 ? 2 : s >= 2 ? 1 : 0; }
         { const int a = atoi(ini.get("video", "aniso", "16").c_str());
@@ -332,6 +384,7 @@ struct App {
         ini.set("video", "no_crowd", no_crowd ? "2" : "0");
         ini.set("video", "ice_bounce", ice_bounce ? "1" : "0");
         ini.set("game", "skip_intro", skip_intro ? "1" : "0");
+        { static const char* const g[] = { "0", "6", "12", "18" }; ini.set("game", "usermusic_gain", g[um_gain & 3]); }
         ini.set("video", "msaa", kMsaa[msaa].value);
         ini.set("video", "aniso", kAniso[aniso].value);
         ini.set("video", "render_scale", kScale[rscale].value);
@@ -477,6 +530,17 @@ struct App {
         std::error_code ec;
         crashed = false;
         if (!fs::exists(exe, ec)) { status = "NHLLegacy.exe is missing from " + narrow(install.wstring()); return; }
+        if (audio_busy) { status = "An audio pack is still being made or installed -- press PLAY when it is done."; return; }
+        // #318: songs in music\EA Trax -> the game's music bank (data\trax), before the compose
+        // lays it on top. A failure only costs the extra songs, never the game.
+        std::string trax_note;
+        if (std::string err = build_trax(install.wstring(), &trax_note); !err.empty()) trax_err = err;
+        else trax_err.clear();
+        if (std::string err = apply_pending_audio(install.wstring(), nullptr); !err.empty()) {   // #321
+            std::lock_guard<std::mutex> l(audio_m);
+            audio_msg = "Could not apply the audio pack's Custom Audio setup: " + err;
+            audio_failed = true;
+        }
         if (std::string err = compose_hdd0(install.wstring(), nullptr); !err.empty()) {
             status = "Could not apply mods: " + err;
             return;
@@ -865,7 +929,222 @@ void draw_graphics(App& app, float cw)
     changed |= ui::toggle_row("Skip the intro", &app.skip_intro,
                               "Goes straight to the main menu: no intro video, legal screen, Press Start or autosave "
                               "notice (autosave stays on). From Puck Peak's RPCS3 patch. Applies when you press PLAY.", cw);
+    static const char* const um_gain[] = { "Game default", "Loud (+6 dB)", "Louder (+12 dB)", "Loudest (+18 dB)" };
+    changed |= ui::choice_row("Your music volume", &app.um_gain, um_gain, 4,
+                              "Volume of your own songs, goal horns and goal songs from the music folder (Custom "
+                              "Audio). The game plays them much quieter than its own sounds. Applies when you press "
+                              "PLAY.", cw);
     if (changed) app.save_video();
+    ui::gap(20);
+}
+
+// #318: your own music. NHLLegacy.exe reads <install>\music (nhl_usermusic.cpp):
+// each sub-folder is a playlist the game's Custom Audio screen can assign to
+// menu music, goal songs, intermission and so on.
+void kv_row(const char* k, const std::string& v, float w);
+
+struct MusicScan {
+    std::vector<std::pair<std::string, int>> lists;   // playlist folder, songs
+    int loose = 0;
+    std::vector<TraxSong> trax;                       // music\EA Trax (#318)
+    double when = -100.0;
+};
+
+bool is_song(const fs::path& p)
+{
+    std::wstring e = p.extension().wstring();
+    for (auto& c : e) c = (wchar_t)towlower(c);
+    return e == L".mp3" || e == L".m4a" || e == L".aac" || e == L".mp4" || e == L".wav" || e == L".wma" ||
+           e == L".flac";
+}
+
+void scan_music(const fs::path& root, MusicScan& s)
+{
+    s.lists.clear();
+    s.loose = 0;
+    std::error_code ec;
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->is_directory(ec)) {
+            int n = 0;
+            for (fs::recursive_directory_iterator r(it->path(), ec), e2; !ec && r != e2; r.increment(ec))
+                if (r->is_regular_file(ec) && is_song(r->path())) n++;
+            ec.clear();
+            if (_wcsicmp(it->path().filename().c_str(), L"EA Trax") == 0) continue;   // its own section
+            s.lists.push_back({ narrow(it->path().filename().wstring()), n });
+        } else if (it->is_regular_file(ec) && is_song(it->path())) {
+            s.loose++;
+        }
+    }
+    std::sort(s.lists.begin(), s.lists.end());
+    s.trax = trax_songs(root.parent_path().wstring());
+}
+
+void draw_music(App& app, float cw)
+{
+    static MusicScan scan;
+    const fs::path root = app.install / "music";
+    const double now = ImGui::GetTime();
+    if (app.mods_dirty || now - scan.when > 3.0) { scan_music(root, scan); scan.when = now; }
+
+    ui::section("YOUR MUSIC");
+    ui::para(ui::F.body, 16, ui::kDim,
+             "Put songs (mp3, m4a, aac, wav, wma, flac) in the music folder, one sub-folder per playlist. In the game, "
+             "open Custom Audio and give a playlist to Menu Music, your goal song, intermission and the rest.", cw);
+    ui::gap(12);
+    if (ui::button("Open music folder", px(200, 46))) {
+        std::error_code ec;
+        fs::create_directories(root, ec);
+        open_folder(root);
+    }
+    ui::gap(10);
+    ui::begin_card(cw);
+    if (scan.lists.empty() && scan.loose == 0) {
+        ui::para(ui::F.body_b, 17, ui::kFg, "No music yet");
+        ui::gap(4);
+        ui::para(ui::F.body, 15, ui::kDim, "Example: music\\Menu\\song.mp3 shows up in the game as the playlist Menu.",
+                 cw - px(44));
+    } else {
+        for (const auto& l : scan.lists) {
+            char n[32];
+            snprintf(n, sizeof n, l.second == 1 ? "1 song" : "%d songs", l.second);
+            kv_row(n, l.first, cw - px(44));
+        }
+        if (scan.loose) {
+            char n[64];
+            snprintf(n, sizeof n, "%d loose song%s (in All music only)", scan.loose, scan.loose == 1 ? "" : "s");
+            ui::para(ui::F.body, 15, ui::kDim, n, cw - px(44));
+        }
+    }
+    ui::end_card();
+    ui::gap(20);
+
+    // #321: share the whole setup as one file.
+    ui::section("AUDIO PACKS");
+    ui::para(ui::F.body, 16, ui::kDim,
+             "Share your goal horns, goal songs and the rest in one file: Make audio pack saves your music folder and "
+             "your Custom Audio choices as a .nhlaudio file. Drop a .nhlaudio file on this window to install one: its "
+             "songs join your music folder and its Custom Audio choices replace yours (your profile is backed up first).",
+             cw);
+    ui::gap(12);
+    ImGui::BeginDisabled(app.audio_busy || app.game_running);
+    if (ui::button("Make audio pack...", px(220, 46))) {
+        app.pack_scan = scan_audio_pack(app.install.wstring());
+        app.pack_pick.assign(app.pack_scan.items.size(), 1);
+        app.pack_table = app.pack_scan.has_table && app.pack_scan.slots > 0;
+        app.pack_choose = true;
+    }
+    ImGui::SameLine(0, px(12));
+    if (ui::button("Install audio pack...", px(240, 46))) {
+        const std::wstring p = pick(false, L"Choose an audio pack", L"Audio packs", L"*.nhlaudio;*.zip");
+        if (!p.empty()) app.audio_job(false, { p });
+    }
+    ImGui::SameLine(0, px(12));
+    if (ui::button("Open packs folder", px(220, 46))) open_folder(app.install / "audio packs");
+    ImGui::EndDisabled();
+    if (app.pack_choose && !app.audio_busy) {
+        const AudioPackScan& s = app.pack_scan;
+        ui::gap(12);
+        ui::begin_card(cw);
+        const float iw = cw - px(44);
+        ui::para(ui::F.body_b, 17, ui::kFg, "Choose what goes in the pack", iw);
+        ui::gap(6);
+        if (s.items.empty()) ui::para(ui::F.body, 15, ui::kDim, "Your music folder is empty.", iw);
+        uint64_t bytes = 0;
+        int songs = 0, slots_in = 0;
+        for (size_t i = 0; i < s.items.size(); i++) {
+            const AudioPackItem& it = s.items[i];
+            char sz[48], use[64] = "";
+            snprintf(sz, sizeof sz, "%d song%s, %.0f MB", it.songs, it.songs == 1 ? "" : "s", it.bytes / 1048576.0);
+            if (it.slots) snprintf(use, sizeof use, "  -  used by %d Custom Audio slot%s", it.slots, it.slots == 1 ? "" : "s");
+            const std::string note = std::string(sz) + use;
+            bool v = app.pack_pick[i] != 0;
+            const std::string id = it.label + "##pack" + std::to_string(i);
+            if (ui::toggle_row(id.c_str(), &v, "Put this playlist (its songs and covers) in the pack.", iw, note.c_str())) app.pack_pick[i] = v;
+            if (v) { bytes += it.bytes; songs += it.songs; slots_in += it.slots; }
+        }
+        ui::gap(6);
+        char tnote[128];
+        if (!s.has_table) snprintf(tnote, sizeof tnote, "not available: %s", s.table_note.c_str());
+        else if (!s.slots) snprintf(tnote, sizeof tnote, "nothing assigned yet");
+        else snprintf(tnote, sizeof tnote, slots_in == 1 ? "1 slot goes with the chosen playlists" : "%d slots go with the chosen playlists", slots_in);
+        ImGui::BeginDisabled(!s.has_table || !s.slots);
+        ui::toggle_row("Custom Audio choices##packtable", &app.pack_table,
+                       "Which song each Custom Audio slot plays (goal song, goal horn, menu music...). Installing the pack "
+                       "sets these for the other player. Only slots whose songs are in the pack are included.", iw, tnote);
+        ImGui::EndDisabled();
+        const bool table = app.pack_table && s.has_table && slots_in > 0;
+        const int left_out = s.slots - slots_in;
+        if (app.pack_table && s.slots && left_out > 0) {
+            char w[160];
+            snprintf(w, sizeof w, left_out == 1 ? "1 assigned slot is left out: its song is not in the pack."
+                                                : "%d assigned slots are left out: their songs are not in the pack.", left_out);
+            ui::para(ui::F.body, 15, ui::kDim, w, iw);
+        }
+        ui::gap(10);
+        char total[96];
+        snprintf(total, sizeof total, "%d song%s, %.0f MB", songs, songs == 1 ? "" : "s", bytes / 1048576.0);
+        ui::para(ui::F.body, 16, ui::kFg, total, iw);
+        ui::gap(8);
+        std::vector<std::wstring> folders;
+        for (size_t i = 0; i < s.items.size(); i++) if (app.pack_pick[i]) folders.push_back(s.items[i].folder);
+        ImGui::BeginDisabled(folders.empty() && !table);
+        if (ui::button("Save pack", px(180, 44), ui::Btn::Primary)) {
+            app.audio_job(true, folders, table);
+            app.pack_choose = false;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine(0, px(12));
+        if (ui::button("Cancel##pack", px(140, 44))) app.pack_choose = false;
+        ui::end_card();
+    }
+    {
+        std::string msg;
+        bool failed;
+        std::wstring file;
+        { std::lock_guard<std::mutex> l(app.audio_m); msg = app.audio_msg; failed = app.audio_failed; file = app.audio_file; }
+        if (!msg.empty()) {
+            ui::gap(10);
+            status_line(failed ? msg : "", msg, cw);
+            if (!file.empty() && !app.audio_busy) {
+                ui::gap(6);
+                if (ui::button("Show the file", px(200, 40))) {
+                    const std::wstring args = L"/select,\"" + file + L"\"";
+                    ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+                }
+            }
+        }
+    }
+    ui::gap(20);
+
+    // #318: extra songs in Customize EA Sports Trax.
+    ui::section("EA TRAX");
+    ui::para(ui::F.body, 16, ui::kDim,
+             "Songs in music\\EA Trax join the game's own list in Customize EA Sports Trax, and play in the "
+             "menus like the others. Name a file \"Artist - Title\" if it has no tags. They are added when you press "
+             "PLAY; the first time takes a few seconds per song.", cw);
+    ui::gap(12);
+    if (ui::button("Open EA Trax folder", px(220, 46))) {
+        std::error_code ec;
+        fs::create_directories(root / "EA Trax", ec);
+        open_folder(root / "EA Trax");
+    }
+    ui::gap(10);
+    if (!app.trax_err.empty()) {
+        status_line("Could not add your EA Trax songs at the last PLAY: " + app.trax_err, "", cw);
+        ui::gap(8);
+    }
+    ui::begin_card(cw);
+    if (scan.trax.empty()) {
+        ui::para(ui::F.body_b, 17, ui::kFg, "No EA Trax songs yet");
+    } else {
+        for (size_t i = 0; i < scan.trax.size(); i++) {
+            const TraxSong& t = scan.trax[i];
+            const std::string line = t.title + (t.artist.empty() ? "" : "  \xC2\xB7  " + t.artist);
+            ui::para(i < (size_t)kTraxMax ? ui::F.body_b : ui::F.body, 16, i < (size_t)kTraxMax ? ui::kFg : ui::kDim,
+                     (i < (size_t)kTraxMax ? line : line + "  (not added: too many)").c_str(), cw - px(44));
+        }
+    }
+    ui::end_card();
     ui::gap(20);
 }
 
@@ -971,6 +1250,7 @@ void draw_mods(App& app, float cw)
     ui::para(ui::F.body_b, 17, ui::kFg, r.c_str(), cw);
     ui::para(ui::F.body, 15, ui::kDim, "Your own saved rosters and in-game edits to each roster are kept when you switch.", cw);
     ui::gap(20);
+    draw_music(app, cw);
 }
 
 void kv_row(const char* k, const std::string& v, float w)
@@ -1142,7 +1422,10 @@ void draw_frame(App& app)
         if (app.screen == Screen::Setup)
             for (const std::wstring& w : g_drops) app.take_drop(w);
         else if (app.screen == Screen::Home && !app.game_running) {
-            app.import_mods(g_drops);
+            std::vector<std::wstring> packs, mods;   // #321: audio packs are not mods
+            for (const std::wstring& w : g_drops) (is_audio_pack(w) ? packs : mods).push_back(w);
+            if (!packs.empty()) app.audio_job(false, packs);
+            if (!mods.empty()) app.import_mods(mods);
             app.set_page(kMods, false);
         }
         g_drops.clear();
@@ -1296,6 +1579,43 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
                 return err.empty() ? 0 : 1;
             }
             else if (!wcscmp(argv[i], L"--page")) app.page = std::clamp(_wtoi(argv[++i]), 0, kPages - 1);
+            else if (!wcscmp(argv[i], L"--audio-pack")) {
+                // #321 without a window: "export" makes a pack, else installs that file;
+                // result line in <install>\logs\audio_pack.log, exit code 0 = done
+                const std::wstring a = argv[++i];
+                std::string sum;
+                std::wstring out;
+                // export: every folder (or --audio-pack "export:Goal Horn|Goal Song" for some;
+                // a trailing "|-" leaves the Custom Audio choices out)
+                std::string err;
+                if (a.rfind(L"export", 0) == 0) {
+                    std::vector<std::wstring> folders;
+                    bool table = true;
+                    if (a.size() > 7 && a[6] == L':') {
+                        std::wstring rest = a.substr(7);
+                        for (size_t p = 0; p <= rest.size();) {
+                            size_t q = rest.find(L'|', p);
+                            if (q == std::wstring::npos) q = rest.size();
+                            const std::wstring f = rest.substr(p, q - p);
+                            if (f == L"-") table = false;
+                            else folders.push_back(f == L"." ? L"" : f);
+                            p = q + 1;
+                        }
+                    } else {
+                        for (const AudioPackItem& it : scan_audio_pack(app.install.wstring()).items) folders.push_back(it.folder);
+                    }
+                    err = export_audio_pack(app.install.wstring(), folders, table, &out, &sum);
+                } else {
+                    err = import_audio_pack(app.install.wstring(), fs::absolute(a).wstring(), &sum);
+                }
+                std::error_code ec;
+                fs::create_directories(app.install / "logs", ec);
+                if (FILE* f = _wfopen((app.install / "logs" / "audio_pack.log").c_str(), L"wb")) {
+                    fputs(err.empty() ? sum.c_str() : err.c_str(), f);
+                    fclose(f);
+                }
+                return err.empty() ? 0 : 1;
+            }
         }
         LocalFree(argv);
         // --make-report: the "Create bug report" zip without a window; the result line
@@ -1325,8 +1645,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
         // --compose: what PLAY does to data\hdd0 (update + enabled mods), without a
         // window; the result line goes to <install>\logs\compose.log, exit code 0 = done.
         if (compose) {
-            std::string summary;
-            const std::string err = compose_hdd0(app.install.wstring(), &summary);
+            std::string summary, trax;
+            std::string err = build_trax(app.install.wstring(), &trax);   // #318, as PLAY does
+            if (!err.empty()) err = "EA Trax: " + err;
+            else if (err = compose_hdd0(app.install.wstring(), &summary); err.empty()) summary = trax + "; " + summary;
             std::error_code ec;
             fs::create_directories(app.install / "logs", ec);
             if (FILE* f = _wfopen((app.install / "logs" / "compose.log").c_str(), L"wb")) {
@@ -1354,8 +1676,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 
     ImGui_ImplWin32_EnableDpiAwareness();
     const float scale = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY));
-    WNDCLASSEXW wc = { sizeof wc, CS_CLASSDC, wnd_proc, 0, 0, inst, LoadIconW(nullptr, IDI_APPLICATION),
-                       LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr, L"NHLLauncher", nullptr };
+    HICON icon_big = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
+    HICON icon_sm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    WNDCLASSEXW wc = { sizeof wc, CS_CLASSDC, wnd_proc, 0, 0, inst, icon_big ? icon_big : LoadIconW(nullptr, IDI_APPLICATION),
+                       LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr, L"NHLLauncher", icon_sm };
     RegisterClassExW(&wc);
     // 1280x800 (the layout's design size) at the screen's DPI, shrunk to fit the work area.
     RECT wa;
@@ -1434,6 +1758,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     if (app.prog) app.prog->cancel = true;
     if (app.worker.joinable()) app.worker.join();
     if (app.report_worker.joinable()) app.report_worker.join();
+    if (app.audio_worker.joinable()) app.audio_worker.join();
     app.mod_cancel = true;
     if (app.mod_worker.joinable()) app.mod_worker.join();
     ui::free_photo(&app.photo);

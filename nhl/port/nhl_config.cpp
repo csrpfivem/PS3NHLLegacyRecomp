@@ -164,6 +164,7 @@ void nhl_config_load(const char* config)
             else if (k == "ice_bounce") set_default("NHL_ICE_BOUNCE", e.val);       /* #298: 0 = no ice light on players */
         } else if (e.sec == "game") {
             if (k == "skip_intro") set_default("NHL_SKIP_INTRO", e.val);            /* #297 */
+            else if (k == "usermusic_gain") set_default("NHL_USERMUSIC_GAIN", e.val); /* #320: dB */
         }
     }
     /* [NHL local patch #267] frame_cap = 30: one guest flip per 33 ms (#262's GCM_FLIP_EVERY),

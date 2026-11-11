@@ -131,6 +131,12 @@ Optional settings:
 
 The easiest way: put `NHLLegacy.exe` in the launcher's install folder and press **PLAY**.
 
+The install folder also needs, beside the exes (the release zip has both):
+- `ffmpeg\ffmpeg.exe` - movies and EA Trax conversion (any recent FFmpeg build with the
+  `mp3_mf` encoder and the `ebur128` / `alimiter` filters, e.g. BtbN's win64 LGPL build);
+- `tools\ealayer3\ealayer3.exe` + `libmpg123.dll` - Ben Moench's EALayer3 encoder, used
+  for the EA Trax songs. Without it the game runs; only the extra Trax songs are skipped.
+
 For development:
 - `tools\run_nhl.ps1` boots `nhl\build\NHLLegacy.exe` against a sandboxed VFS under
   `nhl\vfs` / `nhl\hdd0`, with the environment defaults the game needs. Its header

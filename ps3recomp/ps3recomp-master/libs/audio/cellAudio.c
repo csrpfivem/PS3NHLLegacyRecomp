@@ -282,18 +282,45 @@ static int audio_backend_init(void)
     REFERENCE_TIME buf_duration = 200000; /* 20ms in 100ns units */
     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
-    hr = s_wasapi_client->lpVtbl->Initialize(
-        s_wasapi_client,
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        buf_duration, 0, &wfx, NULL);
+    if (getenv("PS3_AUDIO_FORCE_CONVERT"))   /* #317 test: take the conversion path */
+        hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
+    else
+        hr = s_wasapi_client->lpVtbl->Initialize(
+            s_wasapi_client,
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            buf_duration, 0, &wfx, NULL);
+
+    /* [NHL local patch #317] Shared mode only takes the endpoint's own mix
+     * format unless Windows is allowed to convert. HDMI / soundbars run at
+     * 48 kHz, so the exact request works there; USB DACs and headsets that run
+     * at 44.1 / 96 kHz (or with more channels) refused it with
+     * AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008) and the game was silent
+     * (player reports 11-02 / 11-10). Keep the exact request first so setups
+     * that work are untouched, then let the audio engine resample. */
+    if (hr == AUDCLNT_E_UNSUPPORTED_FORMAT) {
+        WAVEFORMATEX* mix = NULL;
+        if (SUCCEEDED(s_wasapi_client->lpVtbl->GetMixFormat(s_wasapi_client, &mix)) && mix) {
+            printf("[cellAudio] device mix format %lu Hz, %u ch, %u bit -- asking Windows to convert\n",
+                   (unsigned long)mix->nSamplesPerSec, mix->nChannels, mix->wBitsPerSample);
+            CoTaskMemFree(mix);
+        }
+        hr = s_wasapi_client->lpVtbl->Initialize(
+            s_wasapi_client,
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            buf_duration, 0, &wfx, NULL);
+        printf("[cellAudio] WASAPI with format conversion: 0x%08lX\n", hr);
+    }
 
     if (FAILED(hr)) {
         /* Fallback: try without event callback */
         hr = s_wasapi_client->lpVtbl->Initialize(
             s_wasapi_client,
             AUDCLNT_SHAREMODE_SHARED,
-            0, buf_duration, 0, &wfx, NULL);
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+            buf_duration, 0, &wfx, NULL);
         if (FAILED(hr)) {
             printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
             s_wasapi_client->lpVtbl->Release(s_wasapi_client);

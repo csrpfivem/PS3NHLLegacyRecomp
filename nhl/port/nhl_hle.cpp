@@ -525,12 +525,17 @@ extern "C" int nhl_refpack_inplace(ppu_context* ctx)
     return 1;
 }
 extern "C" void nhl_vp6_bridge_init(void);   /* nhl_vp6_bridge.cpp */
+extern "C" void nhl_usermusic_register(void); /* nhl_usermusic.cpp (#316) */
 
 extern "C" void nhl_hle_register(void)
 {
     nhl_vp6_bridge_init();
     const char* e = std::getenv("NHL_FAKE_USERMUSIC");
     if (e && *e && *e != '0') return;
+    /* #316: real user music (cellSearch + cellMusicDecode2 over the "music"
+     * folder). NHL_USERMUSIC=0 falls back to the old failing initialisers. */
+    const char* um = std::getenv("NHL_USERMUSIC");
+    if (!(um && *um == '0')) { nhl_usermusic_register(); return; }
     ps3_hle_register(0xC81CCF8Au, "cellSearchInitialize",       (void*)&nhl_cellSearchInitialize);
     ps3_hle_register(0xF80E31E5u, "cellMusicDecodeInitialize2", (void*)&nhl_cellMusicDecodeInitialize2);
 }

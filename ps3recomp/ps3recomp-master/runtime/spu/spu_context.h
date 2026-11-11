@@ -413,6 +413,9 @@ typedef struct spu_context {
      * add it to every position-derived value, and hand it back here before any
      * transfer to a sibling function. Unused (0) for fixed-base images. */
     uint32_t code_base;
+    /* [NHL local patch #311] ~mfc->tag_completed of this context's MFC engine, kept by
+     * spu_dma.h, so the lifted code's inline MFC_WrTagUpdate needs no engine lookup. */
+    uint32_t mfc_tag_pending;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module

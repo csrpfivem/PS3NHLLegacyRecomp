@@ -946,6 +946,30 @@ static void prof_hit(int tab, uint64_t key)
 static void hz_mods_init(void);                                  /* #152, below */
 static PRUNTIME_FUNCTION hz_lookup(DWORD64 pc, DWORD64* base);
 static int s_hz_mods_ready;
+/* [NHL #312] One sample's unwind, under SEH like hz_unwind: lifted code's tail-call chains
+ * can hand RtlVirtualUnwind a bad frame, and an unguarded fault here killed the game
+ * (cmdprof1, 2026-11-09). A faulting unwind keeps the frames counted so far. */
+static void prof_sample(CONTEXT* c, uintptr_t exe)
+{
+    uint64_t seen[24]; int ns = 0, got = 0;
+    __try {
+        for (int d = 0; d < 24 && c->Rip; d++) {
+            DWORD64 base = 0;
+            PRUNTIME_FUNCTION rf = hz_lookup(c->Rip, &base);   /* #152: lock-free */
+            uint64_t key = rf ? base + rf->BeginAddress : c->Rip;
+            if (d == 0) prof_hit(0, key);
+            /* first exe frame of a sample whose leaf is in a DLL: who called out */
+            if (!got && (uintptr_t)(key - exe) < 0x40000000u) { got = 1; if (d > 0) prof_hit(2, key); }
+            int dup = 0; for (int k = 0; k < ns; k++) dup |= seen[k] == key;
+            if (!dup) { seen[ns++] = key; prof_hit(1, key); }
+            if (!rf) break;                       /* leaf without unwind data: stop */
+            void* hd; DWORD64 ef;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c->Rip, rf, c, &hd, &ef, NULL);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        static volatile LONG n = 0; InterlockedIncrement(&n);   /* counted, not logged: the target is still suspended */
+    }
+}
 static void dbg_prof(DWORD tid, unsigned sec)
 {
     /* Suspending ourselves never resumes: the console would hang for good. */
@@ -962,20 +986,7 @@ static void dbg_prof(DWORD tid, unsigned sec)
         CONTEXT c; c.ContextFlags = CONTEXT_FULL;
         if (GetThreadContext(h, &c)) {
             samples++;
-            uint64_t seen[24]; int ns = 0, got = 0;
-            for (int d = 0; d < 24 && c.Rip; d++) {
-                DWORD64 base = 0;
-                PRUNTIME_FUNCTION rf = hz_lookup(c.Rip, &base);   /* #152: lock-free */
-                uint64_t key = rf ? base + rf->BeginAddress : c.Rip;
-                if (d == 0) prof_hit(0, key);
-                /* first exe frame of a sample whose leaf is in a DLL: who called out */
-                if (!got && (uintptr_t)(key - exe) < 0x40000000u) { got = 1; if (d > 0) prof_hit(2, key); }
-                int dup = 0; for (int k = 0; k < ns; k++) dup |= seen[k] == key;
-                if (!dup) { seen[ns++] = key; prof_hit(1, key); }
-                if (!rf) break;                       /* leaf without unwind data: stop */
-                void* hd; DWORD64 ef;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, rf, &c, &hd, &ef, NULL);
-            }
+            prof_sample(&c, exe);
         }
         ResumeThread(h);
         Sleep(1);
@@ -1259,6 +1270,7 @@ extern "C" int g_lock_hist;
 extern "C" int g_dma_stat;
 extern "C" long long g_chan_n[5], g_chan_tsc[5], g_chan_bytes[5];
 extern "C" volatile int g_coh_fast;
+extern "C" volatile int g_cmdscan_live, g_dma_live;
 extern "C" void spu_lock_sites_report(uintptr_t exe_base, int secs);
 extern "C" void spu_atom_report(int secs);
 extern "C" void spu_coh_lines_report(int secs);
@@ -1292,6 +1304,8 @@ static DWORD WINAPI place_thread(LPVOID)
             }
             if (strstr(line, "usleep=")) g_usleep_block = strstr(line, "usleep=1") != NULL;   /* sys_timer.c */
             g_coh_fast = strstr(line, "cohfast=1") != NULL;   /* spu_coherency.c, #274 */
+            { const char* p = strstr(line, "cmdscan="); g_cmdscan_live = p ? atoi(p + 8) : -1;     /* nhl_cmdscan.c, #307 */
+              p = strstr(line, "dmaloop="); g_dma_live = p ? atoi(p + 8) : -1; }                   /* nhl_cmdscan.c, #309 */
             { const char* p = strstr(line, "polln=");  g_spu_poll_n  = p ? (unsigned)atoi(p + 6) : 64;      /* spu_channels.c */
               p = strstr(line, "pollus=");             g_spu_poll_us = p ? (unsigned)atoi(p + 7) : 100; }
             if (strcmp(line, seen)) fprintf(stderr, "[PLACE] t=%.0fs %s", (ps3_qpc_us() - s_hz_t0) / 1e6, line);
@@ -1950,6 +1964,9 @@ int main(int argc, char** argv)
     { const char* e = getenv("NHL_INJECT_BASE");
       ppu_hle_inject_base = e ? (uint32_t)strtoul(e, 0, 16) : 0xBF000000u;
       printf("[boot] HLE inject base 0x%08X\n", ppu_hle_inject_base); }
+#ifdef _WIN32
+    printf("[boot] ANSI code page %u%s\n", GetACP(), GetACP() == 65001 ? " (UTF-8, #317)" : "");
+#endif
     vm_gate_init();   /* #271 */
     /* The save-data and game-data HLEs marshal their callback structs through
      * fixed guest scratch windows, and the SDK defaults (0x024E0000 / 0x02520000)

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <time.h>
 
 /* Guest-memory stores — out-params from the recompiled title are guest VM
  * addresses, not host pointers. */
@@ -277,8 +278,29 @@ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
         break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_DATE_FORMAT:    v = 0; break; /* YYYYMMDD */
     case CELL_SYSUTIL_SYSTEMPARAM_ID_TIME_FORMAT:    v = 0; break; /* 24-hour */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:       v = 0; break; /* UTC */
-    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME:     v = 0; break; /* No DST */
+    /* [NHL local patch] the host's zone, as the PS3 keeps it: TIMEZONE = standard
+     * offset from UTC in minutes, SUMMERTIME = 1 while daylight saving is on (local =
+     * UTC + TIMEZONE + 60 * SUMMERTIME). Was 0/0, so games that build local time from
+     * these showed UTC: the next day in the US evening (user report 11-11). */
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_TIMEZONE:
+    case CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME: {
+        time_t now = time(NULL);
+        struct tm lt, ut;
+#ifdef _WIN32
+        localtime_s(&lt, &now);
+        gmtime_s(&ut, &now);
+#else
+        localtime_r(&now, &lt);
+        gmtime_r(&now, &ut);
+#endif
+        int dst = lt.tm_isdst > 0;
+        /* minutes local - UTC from the broken-down fields (day may differ by one) */
+        int dd = lt.tm_yday - ut.tm_yday;
+        if (dd > 1) dd = -1; else if (dd < -1) dd = 1;   /* year wrap */
+        int off = dd * 1440 + (lt.tm_hour - ut.tm_hour) * 60 + (lt.tm_min - ut.tm_min);
+        v = (id == CELL_SYSUTIL_SYSTEMPARAM_ID_SUMMERTIME) ? dst : off - (dst ? 60 : 0);
+        break;
+    }
     case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL:           v = 0; break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_GAME_PARENTAL_LEVEL0_RESTRICT: v = 0; break;
     case CELL_SYSUTIL_SYSTEMPARAM_ID_CURRENT_USER_HAS_NP_ACCOUNT:   v = 1; break;

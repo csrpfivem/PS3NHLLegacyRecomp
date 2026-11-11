@@ -33,6 +33,13 @@ Join our discord! https://discord.gg/UU9bpt4Qmx
 - **Movies**: the game's VP6 videos are decoded on the host through an FFmpeg bridge.
 - **Mods and roster packs**: drop a mod's `.zip`, folder or file on the launcher.
   Mods are applied in priority order, so the game's files are never modified.
+- **Your own music** (v1.0.1): playlists in the `music` folder appear in the game's
+  Custom Audio screen (menu music, goal songs, goal horns...) through a native
+  `cellSearch` / `cellMusicDecode2`, with an adjustable volume.
+- **EA Trax** (v1.0.1): up to 60 extra songs in Customize EA Sports Trax, with cover
+  art and even loudness. The launcher rebuilds the music bank when you press PLAY.
+- **Audio packs** (v1.0.1): share playlists plus your Custom Audio choices as one
+  `.nhlaudio` file; dropping one on the launcher installs it.
 
 ### Graphics options (beyond the PS3)
 | Option | Choices |
@@ -76,7 +83,9 @@ Join our discord! https://discord.gg/UU9bpt4Qmx
   - SSE/AVX VMX helpers;
   - AVX-512 SPU code, plus an AVX2 copy that is picked at startup, so one exe runs on
     both kinds of CPU (including the Steam Deck);
-  - a native SPU Edge geometry path.
+  - a native SPU Edge geometry path;
+  - native EALayer3 audio decoding stages and a native graphics command-table scan
+    in place of the lifted SPU loops (v1.0.1).
 - **Rendering fixes found by diffing against RPCS3's shader logs**, for example:
   - the goal light (the vertex-program `RSQ(0)` must give infinity);
   - lineup team-colour bars and dark text panels (Apt colour-transform add term).

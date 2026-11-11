@@ -13,6 +13,7 @@ set(IMGUI third_party/imgui)
 add_executable(NHLLauncher WIN32
     main.cpp
     ui.cpp
+    audio_pack.cpp
     launcher.rc
     bug_report.cpp
     installer.cpp
@@ -20,6 +21,7 @@ add_executable(NHLLauncher WIN32
     iso9660.cpp
     pkg.cpp
     self_decrypt.cpp
+    trax.cpp
     third_party/miniz/miniz.c
     ${IMGUI}/imgui.cpp
     ${IMGUI}/imgui_draw.cpp

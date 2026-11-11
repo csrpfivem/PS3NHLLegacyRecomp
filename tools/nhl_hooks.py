@@ -1,4 +1,4 @@
-"""Re-applies the port's hand hooks to freshly lifted code in nhl/port/recompiled.
+﻿"""Re-applies the port's hand hooks to freshly lifted code in nhl/port/recompiled.
 
 A relift (ppu_lifter.py) regenerates every ppu_recomp_*.cpp and drops anything added by hand.
 This script puts the hooks the port depends on back, anchored on function/label names (which
@@ -225,9 +225,118 @@ def apply_edge_hooks(check_only):
     return True
 
 
+# EALayer3 decoder job recon / corpus capture (nhl_eal3.c; NEXT_STEPS "DE-EMULATION"). Stage
+# numbers = ES_* there. The job is relocatable, so its functions carry `_cb` (load base).
+EAL3_FILE = os.path.join(HERE, "..", "nhl", "port", "spu", "nhl_job_01DE9800", "spu_recomp.c")
+EAL3_FUNC = "void nhl_job_01DE9800_spu_func_%08X(spu_context* ctx) {"
+EAL3_MARKER = "/* [NHL-EAL3] */"
+def _eal3(st): return "nhl_eal3_stage((const void*)ctx, ctx->ls, _cb, %d);" % st
+# NHL_EAL3_NATIVE=1 (#305, nhl_eal3_native.c): native IMDCT + synthesis on the same LS buffers
+def _eal3n(st): return " if (nhl_eal3_native((const void*)ctx, ctx->ls, _cb, %d)) SPU_RET(ctx);" % st
+EAL3_HOOKS = {0x9E18: _eal3(1), 0x8C40: _eal3(2), 0x9FA0: _eal3(3), 0x90A8: _eal3(4) + _eal3n(4), 0xA110: _eal3(5),
+              0xA998: _eal3(6) + _eal3n(6), 0xA168: _eal3(7), 0xA1AC: _eal3(8), 0xA3A8: _eal3(9)}
+EAL3_DECLS = ("void nhl_eal3_stage(const void* regs, const uint8_t* ls, uint32_t code_base, unsigned stage); "
+              "int nhl_eal3_native(const void* regs, uint8_t* ls, uint32_t code_base, unsigned stage);   " + EAL3_MARKER)
+
+
+def apply_spu_hooks(tag, path, func_fmt, marker, hooks, decls, check_only):
+    with open(path, "r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+        lines = f.read().split("\n")
+    if decls in lines and all(any(c.replace("<pre>", "") in l for l in lines) for c in hooks.values()):
+        if not tag.startswith("DMALOOP"): print("  %s: present" % tag)
+        return True
+    if check_only:
+        print("  %s: MISSING" % tag)
+        return False
+    lines = [l for l in lines if marker not in l]   # an older hook set
+    prefix = func_fmt.split("%")[0]
+    index = {l.rstrip("\r"): i for i, l in enumerate(lines) if l.startswith(prefix)}
+    targets = []
+    for addr, call in hooks.items():
+        start = index.get(func_fmt % addr)
+        if start is None:
+            print("  %s: function %X not found; nothing changed" % (tag, addr))
+            return False
+        if call.startswith("<pre>"):   # before the register cache is loaded (the hook edits ctx->gpr)
+            targets.append((start, "        " + call[5:] + "   " + marker))
+            continue
+        ls_line = next(i for i in range(start, start + 4) if "_ls = ctx->ls" in lines[i])
+        targets.append((ls_line, "        " + call + "   " + marker))
+    for i, text in sorted(targets, reverse=True):
+        lines.insert(i + 1, text)
+    first = next(i for i, l in enumerate(lines) if l.startswith(prefix))
+    lines.insert(first, decls)
+    with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
+        f.write("\n".join(lines))
+    print("  %s: applied" % tag)
+    return True
+
+
+# Native Huffman pair loop of the EALayer3 decoder (#314, nhl/port/nhl_eal3_huff.inc): the include
+# carries the code (built with the job's own helpers), the hook sits at the loop head.
+EAL3H_MARKER = "/* [NHL-EAL3H] */"
+EAL3H_DECLS = '#include "../../nhl_eal3_huff.inc"   ' + EAL3H_MARKER
+EAL3H_HOOKS = {0x4E3C: "<pre>{ const int _hm = nhl_eal3_huff_mode(); if (_hm == 1) nhl_eal3_pairs(ctx); "
+                       "else if (_hm >= 2) nhl_eal3_huff_check(ctx, ctx->gpr, ctx->ls, nhl_eal3_pair_dry); }"}
+
+
+# Native table scan in eacgfx_base_command_dispatch_job (nhl_cmdscan.c, #307). Lifted names = LS address.
+CMDSCAN_FILE = os.path.join(HERE, "..", "nhl", "port", "spu", "nhl_prog_01DB3300", "spu_recomp.c")
+CMDSCAN_FUNC = "void nhl_prog_01DB3300_spu_func_%08X(spu_context* ctx) {"
+CMDSCAN_MARKER = "/* [NHL-CMDSCAN] */"
+CMDSCAN_HOOKS = {0xB36C: "<pre>nhl_cmdscan((void*)ctx, ctx->ls, 0);", 0xB348: "nhl_cmdscan((void*)ctx, ctx->ls, 1);"}
+CMDSCAN_DECLS = "void nhl_cmdscan(void* regs, const uint8_t* ls, unsigned site);   " + CMDSCAN_MARKER
+
+
+# Native loop for EA's chunked DMA transfer helper (#309, nhl_cmdscan.c). The same helper sits in
+# 68 lifted images; DMALOOP_STEP is its lifted code, chunk for chunk, on a register file in place.
+DMALOOP_MARKER = "/* [NHL-DMALOOP] */"
+DMALOOP_STEP = (
+    "int nhl_dma_mode(void); void nhl_dma_check(void* ctx, void* g, int (*step)(void*, void*, int)); "
+    "static int nhl_dma_step(void* cv, void* gv, int live) { spu_context* ctx = (spu_context*)cv; u128* g = (u128*)gv; "
+    "g[3] = spu_ori(g[9], 0); g[10] = spu_shlqbyi(g[8], 4); g[4] = spu_clgti(g[5], 3); g[6] = spu_clgti(g[5], 1); "
+    "if (g[5]._u32[0] == 0) return 0; "
+    "g[30] = spu_il(1); g[31] = spu_il(2); g[27] = spu_ceqi(g[4], 0); if (live) spu_wrch(ctx, MFC_LSA, g[3]); "
+    "g[26] = spu_selb(g[30], g[31], g[6]); g[15] = spu_shlqbyi(g[8], 0); g[29] = spu_clgti(g[5], 7); g[28] = spu_il(4); "
+    "g[25] = spu_clgti(g[5], 15); g[23] = spu_ceqi(g[29], 0); g[22] = spu_selb(g[28], g[26], g[27]); "
+    "if (live) spu_wrch(ctx, MFC_EAH, g[15]); g[24] = spu_il(8); if (live) spu_wrch(ctx, MFC_EAL, g[10]); "
+    "g[21] = spu_clgt(g[5], g[14]); g[18] = spu_andi(g[5], -16); g[19] = spu_ceqi(g[25], 0); "
+    "g[20] = spu_selb(g[24], g[22], g[23]); g[6] = spu_ceqi(g[21], 0); g[17] = spu_selb(g[18], g[20], g[19]); "
+    "g[16] = spu_il(16384); g[7] = spu_selb(g[16], g[17], g[6]); g[5] = spu_sf(g[7], g[5]); "
+    "g[4] = spu_rotqmbyi(g[7], -4); g[9] = spu_a(g[9], g[7]); "
+    "if (live) { spu_wrch(ctx, MFC_Size, g[7]); spu_wrch(ctx, MFC_TagID, g[12]); spu_wrch(ctx, MFC_Cmd, g[11]); } "
+    "g[3] = spu_cg(g[8], g[4]); g[2] = spu_shufb(g[3], g[3], g[13]); g[2] = spu_addx(g[8], g[4], g[2]); "
+    "g[8] = spu_ori(g[2], 0); return 1; }   " + DMALOOP_MARKER)
+DMALOOP_CALL = ("<pre>{ const int _dm = nhl_dma_mode(); if (_dm == 1) { while (nhl_dma_step(ctx, ctx->gpr, 1)) { } SPU_RET(ctx); } "
+                "if (_dm >= 2) nhl_dma_check(ctx, ctx->gpr, nhl_dma_step); }")
+
+
+def apply_dmaloop_hooks(check_only):
+    sys.path.insert(0, os.path.join(HERE, "..", "x360"))
+    saved = sys.argv
+    sys.argv = ["dmahelper_scan.py", os.path.join(HERE, "..", "bin", "EBOOT_v101.elf"), os.path.join(HERE, "..", "nhl", "port", "spu")]
+    try:
+        import dmahelper_scan
+    finally:
+        sys.argv = saved
+    ok = True; done = 0
+    for kind, ea, cond in dmahelper_scan.hits:
+        name = "nhl_%s_%08X" % (kind, ea)
+        path = os.path.join(HERE, "..", "nhl", "port", "spu", name, "spu_recomp.c")
+        fmt = "void " + name + "_spu_func_%08X(spu_context* ctx) {"
+        if apply_spu_hooks("DMALOOP " + name, path, fmt, DMALOOP_MARKER, {cond: DMALOOP_CALL}, DMALOOP_STEP, check_only): done += 1
+        else: ok = False
+    print("  DMALOOP: %d of %d images" % (done, len(dmahelper_scan.hits)))
+    return ok
+
+
 def main():
     check_only = "--check" in sys.argv
     ok = all([apply_hook(h, check_only) for h in HOOKS]) and apply_edge_hooks(check_only)
+    ok = apply_spu_hooks("EAL3", EAL3_FILE, EAL3_FUNC, EAL3_MARKER, EAL3_HOOKS, EAL3_DECLS, check_only) and ok
+    ok = apply_spu_hooks("EAL3H", EAL3_FILE, EAL3_FUNC, EAL3H_MARKER, EAL3H_HOOKS, EAL3H_DECLS, check_only) and ok
+    ok = apply_spu_hooks("CMDSCAN", CMDSCAN_FILE, CMDSCAN_FUNC, CMDSCAN_MARKER, CMDSCAN_HOOKS, CMDSCAN_DECLS, check_only) and ok
+    ok = apply_dmaloop_hooks(check_only) and ok
     sys.exit(0 if ok else 1)
 
 

@@ -1,0 +1,7 @@
+// NHLLegacy.exe resources (#317): window/taskbar icon + manifest.
+#include <windows.h>
+
+// ID 1 is what the D3D12 window class loads (rsx_d3d12_backend.c create_window).
+1 ICON "app.ico"
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"

@@ -1,5 +1,8 @@
 #include "resource.h"
 
+// #317: app icon (same art as NHLLegacy.exe); ID 1 so Explorer shows it too.
+1 ICON "app.ico"
+
 IDR_FONT_BODY RCDATA "third_party/fonts/Archivo-Regular.ttf"
 IDR_FONT_BODY_B RCDATA "third_party/fonts/Archivo-SemiBold.ttf"
 IDR_FONT_HEAD RCDATA "third_party/fonts/BigShouldersDisplay-Bold.ttf"

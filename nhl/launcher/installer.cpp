@@ -732,6 +732,7 @@ std::string compose_hdd0(const std::wstring& install_dir, std::string* summary)
     const std::vector<ModInfo> mods = list_mods(install_dir);
     for (auto m = mods.rbegin(); m != mods.rend(); ++m)   // bottom of the list first: the top one wins
         if (m->enabled) add_tree(inst / "mods" / fs::path(widen(m->name)), true);
+    if (fs::exists(inst / "data" / "trax" / "USRDIR", ec)) add_tree(inst / "data" / "trax", true);   // #318 EA Trax songs, on top
 
     // Drop what the previous compose placed. No manifest = an older install that
     // copied files in: that folder is launcher-owned, so clear it.

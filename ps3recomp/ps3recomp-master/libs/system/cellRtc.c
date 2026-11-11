@@ -492,28 +492,53 @@ s32 cellRtcGetDaysInMonth(s32 year, s32 month)
     return s_days_in_month[month - 1];
 }
 
+/* [NHL local patch] Tick <-> date with proleptic-Gregorian day arithmetic (days since
+ * 0001-01-01, H. Hinnant's civil algorithms) instead of gmtime/_mkgmtime: the CRT
+ * calls fail before 1970 (and _mkgmtime after 3000), leaving the result uninitialised
+ * or -1 -- dates came out days off (user report 11-11). Same as real firmware for
+ * every tick / date in years 1..9999. */
+static s64 rtc_days_from_civil(s64 y, s64 m, s64 d)   /* days since 1970-01-01 */
+{
+    y -= m <= 2;
+    const s64 era = (y >= 0 ? y : y - 399) / 400;
+    const s64 yoe = y - era * 400;
+    const s64 doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const s64 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+static void rtc_civil_from_days(s64 z, s64* y, s64* m, s64* d)
+{
+    z += 719468;
+    const s64 era = (z >= 0 ? z : z - 146096) / 146097;
+    const s64 doe = z - era * 146097;
+    const s64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const s64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const s64 mp = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    *m = mp < 10 ? mp + 3 : mp - 9;
+    *y = yoe + era * 400 + (*m <= 2);
+}
+
 s32 cellRtcSetTick(CellRtcDateTime* pDateTime, const CellRtcTick* pTick)
 {
     if (!pDateTime || !pTick)
         return CELL_EINVAL;
 
     u64 tick = rtc_tick_read(pTick);
-    u32 usec = (u32)(tick % USEC_PER_SEC);
-    s64 unix_time = tick_to_time_t(tick);
+    u64 secs = tick / USEC_PER_SEC;              /* since 0001-01-01 */
+    u64 days = secs / 86400, sod = secs % 86400;
+    s64 y, m, d;
+    rtc_civil_from_days((s64)days - (s64)(PS3_UNIX_EPOCH_DIFF / 86400), &y, &m, &d);
 
-    time_t t = (time_t)unix_time;
-    struct tm tm_val;
-#ifdef _WIN32
-    gmtime_s(&tm_val, &t);
-#else
-    gmtime_r(&t, &tm_val);
-#endif
-
-    {
-        CellRtcDateTime dt_s;
-        tm_to_datetime(&tm_val, usec, &dt_s);
-        rtc_dt_write(pDateTime, &dt_s);
-    }
+    CellRtcDateTime dt_s;
+    dt_s.year        = (u16)y;
+    dt_s.month       = (u16)m;
+    dt_s.day         = (u16)d;
+    dt_s.hour        = (u16)(sod / 3600);
+    dt_s.minute      = (u16)(sod / 60 % 60);
+    dt_s.second      = (u16)(sod % 60);
+    dt_s.microsecond = (u32)(tick % USEC_PER_SEC);
+    rtc_dt_write(pDateTime, &dt_s);
     return CELL_OK;
 }
 
@@ -524,13 +549,8 @@ s32 cellRtcGetTick(const CellRtcDateTime* pDateTime, CellRtcTick* pTick)
 
     CellRtcDateTime dt_g;
     rtc_dt_read(pDateTime, &dt_g);
-    struct tm t = datetime_to_tm(&dt_g);
-#ifdef _WIN32
-    time_t tt = _mkgmtime(&t);
-#else
-    time_t tt = timegm(&t);
-#endif
-
-    rtc_tick_write(pTick, time_t_to_tick((s64)tt) + dt_g.microsecond);
+    s64 days = rtc_days_from_civil(dt_g.year, dt_g.month, dt_g.day) + (s64)(PS3_UNIX_EPOCH_DIFF / 86400);
+    s64 secs = days * 86400 + (s64)dt_g.hour * 3600 + (s64)dt_g.minute * 60 + dt_g.second;
+    rtc_tick_write(pTick, (u64)secs * USEC_PER_SEC + dt_g.microsecond);
     return CELL_OK;
 }

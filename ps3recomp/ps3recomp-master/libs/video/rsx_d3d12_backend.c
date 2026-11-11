@@ -1351,6 +1351,11 @@ static HWND create_window(u32 width, u32 height, const char* title)
     wc.lpfnWndProc = d3d12_wndproc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    /* [NHL local patch #317] the port's own icon (resource ID 1 in app.rc), if any. */
+    wc.hIcon   = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
+    wc.hIconSm = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
     wc.lpszClassName = "ps3recomp_d3d12";
     RegisterClassExA(&wc);
 

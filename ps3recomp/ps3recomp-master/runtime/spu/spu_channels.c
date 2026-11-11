@@ -339,6 +339,7 @@ static mfc_engine* mfc_for_slow(spu_context* ctx)
     }
     slot->ctx = ctx;
     mfc_engine_init(&slot->mfc);
+    ctx->mfc_tag_pending = 0;   /* [NHL #311] mirror of ~tag_completed: a fresh engine has every tag complete */
     slot->next = s_mfc_slots;
     s_mfc_slots = slot;
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);

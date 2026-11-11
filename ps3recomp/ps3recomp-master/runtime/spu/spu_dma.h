@@ -1138,8 +1138,10 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
     int rc = mfc_run_list(spu, spu->list_stall_elem_lsa[t], spu->list_stall_remaining[t],
                           spu->list_stall_dest_lsa[t], spu->list_stall_ea_base[t],
                           spu->list_stall_cmd[t], t);
-    if (!(spu->list_stall_mask & (1u << t)))      /* ran to the end: tag done */
+    if (!(spu->list_stall_mask & (1u << t))) {    /* ran to the end: tag done */
         mfc->tag_completed |= (1u << t);
+        spu->mfc_tag_pending = ~mfc->tag_completed;   /* #311 mirror */
+    }
     return rc;
 }
 
@@ -1518,12 +1520,14 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
 
     /* Mark tag as in-progress */
     mfc->tag_completed &= ~(1u << tag);
+    spu->mfc_tag_pending = ~mfc->tag_completed;   /* #311 mirror */
 
     /* Handle sync/barrier commands */
     if (cmd == MFC_BARRIER_CMD || cmd == MFC_EIEIO_CMD || cmd == MFC_SYNC_CMD) {
         /* For synchronous emulation these are no-ops; all prior DMAs
          * have already completed. */
         mfc->tag_completed |= (1u << tag);
+        spu->mfc_tag_pending = ~mfc->tag_completed;   /* #311 mirror */
         return 0;
     }
 
@@ -1780,6 +1784,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     if (!(spu->list_stall_mask & (1u << (tag & 0x1F))) &&
         ((cmd & 0xFFFFu) != MFC_SDCRZ_CMD || rc == 0))
         mfc->tag_completed |= (1u << tag);
+    spu->mfc_tag_pending = ~mfc->tag_completed;   /* #311 mirror */
 
     return rc;
 }
@@ -1857,6 +1862,15 @@ static inline void mfc_channel_write(mfc_engine* mfc, spu_context* spu,
         spu->mfc_tag_mask = value;
         break;
     case MFC_WrTagUpdate:
+        /* [NHL #311] lifted code computes this inline from spu->mfc_tag_pending; this path
+         * (interpreter, tag-event producer) checks the mirror and repairs it. */
+        if (spu->mfc_tag_pending != ~mfc->tag_completed) {
+            static volatile long s_n;
+            if (__atomic_fetch_add(&s_n, 1, __ATOMIC_RELAXED) < 8)
+                fprintf(stderr, "[mfc] TAG MIRROR MISMATCH spu=0x%X pending=%08X engine=%08X\n",
+                        spu->spu_id, spu->mfc_tag_pending, ~mfc->tag_completed);
+            spu->mfc_tag_pending = ~mfc->tag_completed;
+        }
         spu->mfc_tag_status = mfc_tag_wait(mfc, spu->mfc_tag_mask, value);
         /* WWS Run-promotion gate probe: after kCommandsExecuted the job manager
          * only calls ChangeLoadToRunJob if `ceq(RdTagStat, tagMask)` holds, i.e.
