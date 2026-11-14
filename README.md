@@ -45,6 +45,9 @@ Join our discord! https://discord.gg/UU9bpt4Qmx
   handles USB and Bluetooth, rumble and the player-colour light bar, merged with
   XInput pads. A pad that Steam Input already handles is left to Steam. USB is
   recommended: Bluetooth quality depends on the PC (`tools/padprobe.c` measures it).
+- **Every other controller** (v1.0.2): Switch Pro, DualShock 3, and generic or older
+  pads go through SDL3's gamepad database. `SDL3.dll` is loaded at run time from the
+  exe's folder; without it the game runs as before.
 
 ### Graphics options (beyond the PS3)
 | Option | Choices |

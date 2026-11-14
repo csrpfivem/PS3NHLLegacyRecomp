@@ -136,6 +136,9 @@ The install folder also needs, beside the exes (the release zip has both):
   `mp3_mf` encoder and the `ebur128` / `alimiter` filters, e.g. BtbN's win64 LGPL build);
 - `tools\ealayer3\ealayer3.exe` + `libmpg123.dll` - Ben Moench's EALayer3 encoder, used
   for the EA Trax songs. Without it the game runs; only the extra Trax songs are skipped.
+- `SDL3.dll` (optional, the official x64 build from github.com/libsdl-org/SDL releases;
+  the release zip ships 3.4.20). It handles controllers that are neither XInput nor
+  DualSense/DS4. Without it those pads are not seen; everything else works.
 
 For development:
 - `tools\run_nhl.ps1` boots `nhl\build\NHLLegacy.exe` against a sandboxed VFS under
