@@ -196,6 +196,7 @@ typedef struct {
      * scale.y or a bottom origin would mirror the winding against the guest's). */
     float vps_y, vpo_y, vps_z, vpo_z;
     u32 winorg;
+    u32 zb_scale, zb_bias;   /* [#323] polygon offset (float bits) when FILL is enabled, else 0 */
     /* [#114] exec-loop progress in the last render pass: 0 never reached,
      * 1 reached, 2 dropped as placeholder, 3 PSO looked up, 4 drawn;
      * exec_pass = which render_frame pass (s_exec_pass) touched it last. */
@@ -1250,6 +1251,7 @@ static volatile LONG s_shadow_lit = -1;   /* [#189b] shadow_lit_bind state (#188
 static volatile LONG s_shadows_live = -1; /* [#190b] shadows_on() state; F5 (NHL_LIVEKEYS=1) toggles */
 static volatile LONG s_texgamma_live = 0;  /* [#214 diag] F4 (NHL_LIVEKEYS=1): texture-gamma sRGB view mode 0/1/2 */
 static volatile LONG s_shine_live = 0;     /* [#216 diag] F3 (NHL_LIVEKEYS=1): blank one texture role on player draws, 0..5 */
+static volatile LONG s_shcmp_live = 0;     /* [#322] F10 (NHL_SHADOW_CMP=live): 0 old compare order, 1 RSX order */
 static const char* const s_shine_names[6] = {
     "all textures as normal",
     "NO 2D environment reflection map (128x128 DXT5, 1 mip)",
@@ -1311,6 +1313,11 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             InterlockedExchange(&s_texgamma_live, m);
             fprintf(stderr, "[LIVEKEY] F4 texture gamma -> mode %ld (%s)%c", (long)m,
                     m == 0 ? "sRGB views as normal" : m == 1 ? "NO sRGB view for DXT5 gamma textures" : "NO sRGB view for any gamma texture", 10); }
+        if (wp == 0x4E4D) {   /* #322 F10: shadow compare order (NHL_SHADOW_CMP=live) */
+            const LONG m = !s_shcmp_live;
+            InterlockedExchange(&s_shcmp_live, m);
+            fprintf(stderr, "[SHADOWCMP] F10 -> %s t=%.1f%c", m ? "RSX (depth FUNC reference)" : "OLD (reference FUNC depth)",
+                    GetTickCount64() / 1000.0, 10); }
         if (wp == 0x4E49) {   /* #122 F8; the message time = when the key was pressed */
             g_hitch_mark_tick = (long)GetMessageTime(); InterlockedIncrement(&g_hitch_mark_req); }
         return 0;
@@ -3860,8 +3867,10 @@ static void dr_note_view(D3D12DrawRecord* dr)
      * a frame, ex=1). Every VP draw record passes through here: clear it. */
     dr->is_blit = 0;
     dr->is_depth = 0; dr->zmask = 0; dr->dcz = 0;   /* #190/#209: same reuse hazard */
+    dr->zb_scale = 0; dr->zb_bias = 0;
     const rsx_state* st = s_d3d.current_rsx_state;
     if (!st) return;
+    if (st->poly_offset_fill & 1u) { dr->zb_scale = st->poly_offset_scale; dr->zb_bias = st->poly_offset_bias; }   /* #323 */
     dr->vps_y = st->viewport_scale[1];  dr->vpo_y = st->viewport_offset[1];
     dr->vps_z = st->viewport_scale[2];  dr->vpo_z = st->viewport_offset[2];
     dr->winorg = st->shader_window;
@@ -4595,6 +4604,14 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
              * constant values. Refuse rather than cache it. */
             static int _rb = 0; if (_rb++ < 8)
                 fprintf(stderr, "[FP] fp=0x%08X: buffered constant block not rebound -- skipped%c", fp_addr, 10);
+            return NULL;
+        }
+        /* [#322] live shadow-compare helpers read rsx_texscale[0].z: give constant-less
+         * programs the backend b1 layout too (kc > 0 ones were rebound above) */
+        if (n > 0 && kc == 0 && g_rsx_fp_shadow_cmp_mode == 2 && strstr(hlsl, "rsx_texscale[0].z") &&
+            !strstr(hlsl, "    float4 rsx_texscale[4];\n") && !fp_rebind_constants(hlsl, sizeof(hlsl))) {
+            static int _rb = 0; if (_rb++ < 8)
+                fprintf(stderr, "[SHADOWCMP] fp=0x%08X: no b1 block to rebind -- skipped%c", fp_addr, 10);
             return NULL;
         }
         { static int _once = 0; if (!_once++) fprintf(stderr, "[FP] buffered fragment constants on (#78)%c", 10); }
@@ -6712,6 +6729,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
             }
             ts[_u*4+0] = sx; ts[_u*4+1] = sy; ts[_u*4+2] = 0.0f; ts[_u*4+3] = 0.0f;
         }
+        ts[2] = s_shcmp_live ? 1.0f : 0.0f;   /* #322: rsx_texscale[0].z = shadow compare order (live mode) */
         /* rsx_alphatest (b1[4]): x=enable, y=ref/255, z=func-0x200. D3D12
          * has no fixed alpha test; guest FPs discard on it dynamically
          * (wave's colour wheel is a disc via alpha test -- without it the
@@ -7384,15 +7402,21 @@ static void shadowz_transition(int i, D3D12_RESOURCE_STATES to)
     z->st = to;
 }
 /* depth-only pipelines: the draw's VS, no pixel shader, no colour target, D32 */
-typedef struct { int vs_idx; u32 vs_hash, dk, cull; ID3D12PipelineState* pso; } DepthPSO;
+typedef struct { int vs_idx; u32 vs_hash, dk, cull, zbs, zbb; ID3D12PipelineState* pso; } DepthPSO;
 static DepthPSO s_dpso[256];
 static int s_dpso_n;
-static ID3D12PipelineState* depth_pso_get(int vs_idx, u32 dk, u32 cull)
+static ID3D12PipelineState* depth_pso_get(int vs_idx, u32 dk, u32 cull, u32 zbs, u32 zbb)
 {
     if (vs_idx < 0 || vs_idx >= s_d3d.vp_vs_n || !s_d3d.vp_vs[vs_idx].vs) return NULL;
+    /* [NHL local patch #323] guest polygon offset on the depth-only (shadow) pass. RPCS3:
+     * glPolygonOffset(scale, bias) / vkCmdSetDepthBias(bias, 0, scale), so scale = slope factor and
+     * bias = constant units (D3D12 DepthBias is integer units; NHL's -5e-6 rounds to 0). NHL_ZBIAS=0 = off. */
+    static int s_zb = -1; if (s_zb < 0) { const char* e = getenv("NHL_ZBIAS"); s_zb = (e && *e == '0') ? 0 : 1; }
+    if (!s_zb) zbs = zbb = 0;
     const u32 vh = s_d3d.vp_vs[vs_idx].hash;
     for (int i = 0; i < s_dpso_n; i++)
-        if (s_dpso[i].vs_idx == vs_idx && s_dpso[i].vs_hash == vh && s_dpso[i].dk == dk && s_dpso[i].cull == cull)
+        if (s_dpso[i].vs_idx == vs_idx && s_dpso[i].vs_hash == vh && s_dpso[i].dk == dk && s_dpso[i].cull == cull &&
+            s_dpso[i].zbs == zbs && s_dpso[i].zbb == zbb)
             return s_dpso[i].pso;
     D3D12_INPUT_ELEMENT_DESC il[16];
     for (int _i = 0; _i < 16; _i++) {
@@ -7412,6 +7436,13 @@ static ID3D12PipelineState* depth_pso_get(int vs_idx, u32 dk, u32 cull)
     pd.RasterizerState.CullMode = (cull & 1u) ? ((cull & 2u) ? D3D12_CULL_MODE_FRONT : D3D12_CULL_MODE_BACK)
                                               : D3D12_CULL_MODE_NONE;
     pd.RasterizerState.FrontCounterClockwise = (cull & 4u) ? TRUE : FALSE;
+    { float fs, fb; memcpy(&fs, &zbs, 4); memcpy(&fb, &zbb, 4);
+      if (!(fs == fs) || fs > 64.0f || fs < -64.0f) fs = 0.0f;   /* NaN / absurd guard */
+      if (!(fb == fb) || fb > 1.0e6f || fb < -1.0e6f) fb = 0.0f;
+      pd.RasterizerState.SlopeScaledDepthBias = fs;
+      pd.RasterizerState.DepthBias = (INT)(fb < 0.0f ? fb - 0.5f : fb + 0.5f);
+      if (zbs | zbb) { static int n = 0; if (n++ < 6) fprintf(stderr, "[ZBIAS] depth PSO vs %d: slope %g, bias %g -> DepthBias %d%c",
+                                                         vs_idx, (double)fs, (double)fb, pd.RasterizerState.DepthBias, 10); } }
     pd.SampleMask = UINT_MAX;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pd.NumRenderTargets = 0;
@@ -7425,6 +7456,7 @@ static ID3D12PipelineState* depth_pso_get(int vs_idx, u32 dk, u32 cull)
     if (FAILED(hr)) { static int n = 0; if (n++ < 4) fprintf(stderr, "[SHADOWZ] depth PSO FAIL 0x%08lX (vs %d)%c", (unsigned long)hr, vs_idx, 10); pso = NULL; }
     const int k = (s_dpso_n < 256) ? s_dpso_n++ : (int)(vh & 255u);   /* full: overwrite (old PSO leaked) */
     s_dpso[k].vs_idx = vs_idx; s_dpso[k].vs_hash = vh; s_dpso[k].dk = dk; s_dpso[k].cull = cull; s_dpso[k].pso = pso;
+    s_dpso[k].zbs = zbs; s_dpso[k].zbb = zbb;
     return pso;
 }
 static void fp_shadow_from_draw(const D3D12DrawRecord* dr)
@@ -9683,7 +9715,7 @@ static void render_frame(void)
                                                                        dr->cc[0], 0, 0, NULL);
                         continue;
                     }
-                    ID3D12PipelineState* zp = depth_pso_get(dr->vs_idx, ((u32)dr->fp_exp32 >> 20) & 0x1Fu, dr->cull);
+                    ID3D12PipelineState* zp = depth_pso_get(dr->vs_idx, ((u32)dr->fp_exp32 >> 20) & 0x1Fu, dr->cull, dr->zb_scale, dr->zb_bias);
                     if (!zp) continue;
                     s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, zp);
                     s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
@@ -10945,10 +10977,11 @@ skip_dump_consider: ;
         if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
             extern char g_rsx_title_base[128];
             char tb[256];
-            snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u",
+            snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u%s",
                      g_rsx_title_base,
                      s_tframes * 1000.0 / (double)(tnow - s_tt0),
-                     s_dbg_last_draws, s_d3d.width, s_d3d.height);
+                     s_dbg_last_draws, s_d3d.width, s_d3d.height,
+                     g_rsx_fp_shadow_cmp_mode != 2 ? "" : s_shcmp_live ? " | SHADOW: RSX (F10)" : " | SHADOW: OLD (F10)");
             SetWindowTextA(s_d3d.hwnd, tb);
             s_tframes = 0;
             s_tt0 = tnow;
@@ -13493,6 +13526,17 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
         BOOL ok = RegisterHotKey(s_d3d.hwnd, 0x4E48, 0x4000 /* MOD_NOREPEAT */, VK_F9);
         printf("[CAPKEY] global F9 hotkey %s\n", ok ? "registered" : "FAILED");
     }
+    /* [#322] NHL_SHADOW_CMP = old (default) | rsx | live: shadow-map compare order
+     * (upstream ps3recomp #424 / RPCS3: `depth FUNC reference`). live = both compiled in,
+     * system-wide F10 flips per draw (rsx_texscale[0].z), title bar shows the mode. */
+    { const char* e = getenv("NHL_SHADOW_CMP");
+      /* #323: RSX order is the default (play334, user + RPCS3); NHL_SHADOW_CMP=old = the previous order */
+      g_rsx_fp_shadow_cmp_mode = !e ? 1 : !_stricmp(e, "old") ? 0 : !_stricmp(e, "live") ? 2 : 1;
+      fprintf(stderr, "[SHADOWCMP] mode %s%c", g_rsx_fp_shadow_cmp_mode == 1 ? "rsx (depth FUNC reference)" :
+              g_rsx_fp_shadow_cmp_mode == 2 ? "live (F10 toggles, starts OLD)" : "old (reference FUNC depth)", 10);
+      if (s_d3d.hwnd && g_rsx_fp_shadow_cmp_mode == 2) {
+          BOOL ok = RegisterHotKey(s_d3d.hwnd, 0x4E4D, 0x4000 /* MOD_NOREPEAT */, VK_F10);
+          fprintf(stderr, "[SHADOWCMP] global F10 hotkey %s%c", ok ? "registered" : "FAILED", 10); } }
     if (s_d3d.hwnd && getenv("NHL_LIVEKEYS")) {   /* #189b: system-wide F5 = shadow-map units lit on/off */
         BOOL ok = RegisterHotKey(s_d3d.hwnd, 0x4E4A, 0x4000 /* MOD_NOREPEAT */, VK_F5);
         fprintf(stderr, "[LIVEKEY] global F5 hotkey %s\n", ok ? "registered" : "FAILED");

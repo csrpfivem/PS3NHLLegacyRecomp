@@ -434,6 +434,31 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * for the frequency divisor (instancing). Captured for read_vp_vertex. */
     if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
 
+    /* [NHL local patch #322 diag] Does NHL use state the D3D12 backend ignores? Polygon offset
+     * (0xA60/A64/A68 enables, 0xA78 scale, 0xA7C bias), user clip planes (0x1478), depth clamp
+     * (0x1D78; upstream #562/#537/#693). Logs each method's first 6 value changes. Not consumed. */
+    if ((method >= 0x0A60 && method <= 0x0A68) || method == 0x0A78 || method == 0x0A7C ||
+        method == 0x1478 || method == 0x1D78) {
+        if (method == 0x0A68) state->poly_offset_fill = data;    /* #323: consumed by depth-only PSOs */
+        if (method == 0x0A78) state->poly_offset_scale = data;
+        if (method == 0x0A7C) state->poly_offset_bias = data;
+        static u32 s_last[8] = { 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu,
+                                 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu };
+        static int s_n[8];
+        const int i = method == 0x0A60 ? 0 : method == 0x0A64 ? 1 : method == 0x0A68 ? 2 :
+                      method == 0x0A78 ? 3 : method == 0x0A7C ? 4 : method == 0x1478 ? 5 : 6;
+        if (data != s_last[i] && s_n[i] < 6) {
+            static const char* nm[7] = { "POLY_OFFSET_POINT_ENABLE", "POLY_OFFSET_LINE_ENABLE",
+                "POLY_OFFSET_FILL_ENABLE", "POLYGON_OFFSET_SCALE", "POLYGON_OFFSET_BIAS",
+                "USER_CLIP_PLANE_CONTROL", "ZMIN_MAX_CONTROL" };
+            float f; memcpy(&f, &data, 4);
+            s_n[i]++;
+            fprintf(stderr, "[NHL-RSXSTATE] %s (0x%04X) = 0x%08X (%g)%s\n", nm[i], method, data, (double)f,
+                    s_n[i] == 6 ? " [last log for this method]" : "");
+        }
+        s_last[i] = data;
+    }
+
     { static u32 s_sem_off = 0;
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
       if (method == 0x1D70) {

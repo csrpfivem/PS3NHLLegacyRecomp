@@ -136,6 +136,7 @@ typedef struct rsx_fp_shadow_desc {
 } rsx_fp_shadow_desc;
 /* [NHL local patch #254] shadow-map resource size / guest size (set by the backend once) */
 extern float g_rsx_fp_shadow_scale;
+extern int g_rsx_fp_shadow_cmp_mode;   /* #322: 0 old order, 1 RSX `depth FUNC reference`, 2 live (F10) */
 void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
     u32 dimension, u32 cube, u32 mips, u32 filter, u32 address, u32 control0);
 u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes);

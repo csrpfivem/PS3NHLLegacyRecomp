@@ -467,6 +467,7 @@ u32 rsx_fp_texture_units(const u8* ucode, u32 max_bytes)
 }
 
 float g_rsx_fp_shadow_scale = 1.0f;   /* #254: shadow-map resource size / guest size */
+int g_rsx_fp_shadow_cmp_mode = 0;     /* #322: 0 old `reference FUNC depth`, 1 RSX order, 2 live (F10) */
 
 static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
                               const rsx_fp_shadow_desc* d)
@@ -476,11 +477,25 @@ static void fp_shadow_helper(Out* p, u32 unit, u32 cube_mask,
     const char* cmp[] = { "0.0", "reference < depth", "reference == depth",
         "reference <= depth", "reference > depth", "reference != depth",
         "reference >= depth", "1.0" };
+    /* [NHL local patch #322] RSX order = `depth FUNC reference` (upstream ps3recomp #424;
+     * RPCS3 VKDraw.cpp get_compare_func(tex.zfunc(), true)). Mode 0 keeps the old text
+     * byte-identical (shader cache unchanged); 2 picks per draw from rsx_texscale[0].z
+     * (backend b1 layout, F10 toggles). */
+    const char* rcmp[] = { "0.0", "depth < reference", "depth == reference",
+        "depth <= reference", "depth > reference", "depth != reference",
+        "depth >= reference", "1.0" };
+    if (g_rsx_fp_shadow_cmp_mode == 2)
+        snprintf(text, sizeof text,
+            "float _rsx_shadow_cmp%u(float reference, float depth) { return rsx_texscale[0].z != 0.0 ? (float)(%s) : (float)(%s); }\n"
+            "float4 _rsx_shadow%u(float3 coordinate) {\n"
+            "    float reference = saturate(coordinate.z);\n",
+            unit, rcmp[d->func], cmp[d->func], unit);
+    else
     snprintf(text, sizeof text,
         "float _rsx_shadow_cmp%u(float reference, float depth) { return (float)(%s); }\n"
         "float4 _rsx_shadow%u(float3 coordinate) {\n"
         "    float reference = saturate(coordinate.z);\n",
-        unit, cmp[d->func], unit);
+        unit, g_rsx_fp_shadow_cmp_mode == 1 ? rcmp[d->func] : cmp[d->func], unit);
     out_puts(p, text);
     if (d->linear || d->unnormalized) {
         snprintf(text, sizeof text, "    uint width, height; %s.GetDimensions(width, height);\n"

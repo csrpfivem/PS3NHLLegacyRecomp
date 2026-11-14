@@ -398,6 +398,9 @@ typedef struct rsx_state {
      * bits12-15 origin (0 top, 1 bottom), bits16-19 pixel centre. Diagnostic for
      * now (manifest + [WINORG]); the backend still maps x/y as identity. */
     u32 shader_window;
+    /* [NHL local patch #323] NV4097_SET_POLY_OFFSET_FILL_ENABLE (0xA68), POLYGON_OFFSET_SCALE_FACTOR
+     * (0xA78) and _BIAS (0xA7C, float bits). NHL's shadow pass: fill 1, scale 0.55, bias -5e-6. */
+    u32 poly_offset_fill, poly_offset_scale, poly_offset_bias;
 } rsx_state;
 
 /* ---------------------------------------------------------------------------

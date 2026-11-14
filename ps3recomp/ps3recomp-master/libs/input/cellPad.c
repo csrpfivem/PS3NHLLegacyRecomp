@@ -11,6 +11,9 @@
  */
 
 #include <time.h>
+#include <ctype.h>
+#include <wchar.h>
+#include <wctype.h>
 #include "cellPad.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -251,14 +254,541 @@ static void pad_poll_xinput(void)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * [NHL local patch #324] Native PS5 DualSense / PS4 DualShock 4 (raw HID).
+ *
+ * Sony pads are not XInput devices, so without Steam Input or DS4Windows the
+ * game never saw them. This reads them straight from hid.dll: USB and
+ * Bluetooth, DualSense (+Edge) and DS4 v1/v2 (+wireless adapter). Rumble and a
+ * per-player lightbar go out as output reports.
+ *
+ *  - A hot-plug thread enumerates HID every 2 s (paths are pre-filtered by
+ *    VID/PID text, so no other device is ever opened). Each pad gets a reader
+ *    thread; the game's poll only copies the latest parsed state (no hitch).
+ *  - Ports: XInput slot i stays port i exactly as before. A Sony pad takes the
+ *    lowest port XInput leaves empty and keeps it while connected. Keyboard
+ *    fallback still fills port 0 only when nothing is there.
+ *  - Duplicates: pads Steam Input already virtualises are listed by Steam in
+ *    SDL_GAMECONTROLLER_IGNORE_DEVICES; those are skipped (SDL does the same).
+ *    An exclusive owner (DS4Windows/HidHide) makes our open fail -> skipped.
+ *  - Off under Wine/Proton (wine_xinput_hid already works on the Deck);
+ *    PAD_SONY_HID=1 forces it on. PAD_NO_SONY_HID=1 turns it off anywhere.
+ * -----------------------------------------------------------------------*/
+#include <setupapi.h>
+#include <hidsdi.h>
+#pragma comment(lib, "hid.lib")
+#pragma comment(lib, "setupapi.lib")
+
+#define SONY_MAX_PADS 4
+
+typedef struct {
+    volatile LONG  used;          /* slot owned by a live device */
+    volatile LONG  dead;          /* reader saw the device go away */
+    volatile LONG  stop;
+    HANDLE         h, thread, wthread, wake;
+    volatile unsigned st_writes, st_wfail, st_wmax;   /* #324e stats */
+    volatile unsigned long long last_rpt_ms;          /* #324g stale guard */
+    WCHAR          path[512];
+    int            is_ds5, is_bt;
+    USHORT         in_len, out_len;
+    int            port;          /* host port, -1 until assigned */
+    SRWLOCK        lock;
+    PadHostState   st;            /* guarded by lock */
+    int            have_data;
+    volatile LONG  motor_large, motor_small, led_dirty;
+    int            sent_large, sent_small;
+    u8             out_seq;
+} SonyPad;
+
+static SonyPad        s_sony[SONY_MAX_PADS];
+static HANDLE         s_sony_hotplug = NULL;
+static volatile LONG  s_sony_stop = 0;
+
+static u32 sony_crc32(const u8* p, size_t n, u32 crc)
+{
+    crc = ~crc;
+    while (n--) {
+        crc ^= *p++;
+        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1)));
+    }
+    return ~crc;
+}
+
+static u8 sony_stick(u8 raw)
+{
+    /* same deadzone + curve as the XInput path, so both feel identical */
+    int s = ((int)raw - 128) * 258;
+    if (s > 32767) s = 32767;
+    if (s < -32768) s = -32768;
+    return pad_xinput_stick_to_u8((short)s, PAD_STICK_DEADZONE);
+}
+
+/* d: LX LY RX RY, then the two button bytes (hat+face, shoulders/sticks/menu),
+ * and the analog triggers. Both pads share this button bit layout. */
+static void sony_fill(PadHostState* o, const u8* d, u8 b0, u8 b1, u8 l2, u8 r2)
+{
+    static const u16 hat[9] = {
+        CELL_PAD_CTRL_UP, CELL_PAD_CTRL_UP | CELL_PAD_CTRL_RIGHT, CELL_PAD_CTRL_RIGHT,
+        CELL_PAD_CTRL_DOWN | CELL_PAD_CTRL_RIGHT, CELL_PAD_CTRL_DOWN,
+        CELL_PAD_CTRL_DOWN | CELL_PAD_CTRL_LEFT, CELL_PAD_CTRL_LEFT,
+        CELL_PAD_CTRL_UP | CELL_PAD_CTRL_LEFT, 0 };
+    u16 btns = hat[(b0 & 0x0F) > 8 ? 8 : (b0 & 0x0F)];
+    if (b0 & 0x10) btns |= CELL_PAD_CTRL_SQUARE;
+    if (b0 & 0x20) btns |= CELL_PAD_CTRL_CROSS;
+    if (b0 & 0x40) btns |= CELL_PAD_CTRL_CIRCLE;
+    if (b0 & 0x80) btns |= CELL_PAD_CTRL_TRIANGLE;
+    if (b1 & 0x01) btns |= CELL_PAD_CTRL_L1;
+    if (b1 & 0x02) btns |= CELL_PAD_CTRL_R1;
+    if (b1 & 0x10) btns |= CELL_PAD_CTRL_SELECT;   /* Share / Create */
+    if (b1 & 0x20) btns |= CELL_PAD_CTRL_START;    /* Options */
+    if (b1 & 0x40) btns |= CELL_PAD_CTRL_L3;
+    if (b1 & 0x80) btns |= CELL_PAD_CTRL_R3;
+    if (l2 > PAD_TRIGGER_THRESHOLD) btns |= CELL_PAD_CTRL_L2;
+    if (r2 > PAD_TRIGGER_THRESHOLD) btns |= CELL_PAD_CTRL_R2;
+    /* PS button / touchpad / mute: ignored */
+
+    o->connected  = 1;
+    o->buttons    = btns;
+    o->analog_lx  = sony_stick(d[0]);
+    o->analog_ly  = sony_stick(d[1]);   /* Sony Y is already up = 0, like PS3 */
+    o->analog_rx  = sony_stick(d[2]);
+    o->analog_ry  = sony_stick(d[3]);
+    o->trigger_l2 = l2;
+    o->trigger_r2 = r2;
+    o->press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
+    o->press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
+    o->press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
+    o->press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
+    o->press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
+    o->press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
+    o->press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
+    o->press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
+    o->press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
+    o->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
+}
+
+static int sony_parse(SonyPad* p, const u8* b, DWORD n, PadHostState* o)
+{
+    if (n < 10) return 0;
+    if (p->is_ds5) {
+        if (b[0] == 0x31 && n >= 13) {                 /* BT full report */
+            const u8* d = b + 2;
+            sony_fill(o, d, d[7], d[8], d[4], d[5]);
+            return 1;
+        }
+        if (b[0] == 0x01) {
+            const u8* d = b + 1;
+            if (!p->is_bt && n >= 11) sony_fill(o, d, d[7], d[8], d[4], d[5]);  /* USB */
+            else                      sony_fill(o, d, d[4], d[5], d[7], d[8]);  /* BT simple */
+            return 1;
+        }
+        return 0;
+    }
+    if (b[0] == 0x11 && n >= 12) {                     /* DS4 BT full report */
+        const u8* d = b + 3;
+        sony_fill(o, d, d[4], d[5], d[7], d[8]);
+        return 1;
+    }
+    if (b[0] == 0x01) {                                /* DS4 USB / BT simple */
+        const u8* d = b + 1;
+        sony_fill(o, d, d[4], d[5], d[7], d[8]);
+        return 1;
+    }
+    return 0;
+}
+
+static void sony_write(SonyPad* p, OVERLAPPED* ov)
+{
+    static const u8 led[4][3] = { {0,0,64}, {64,0,0}, {0,64,0}, {64,0,40} };  /* PS player colours */
+    static const u8 ds5_player[4] = { 0x04, 0x0A, 0x15, 0x1B };
+    const int pi = (p->port >= 0 && p->port < 4) ? p->port : 0;
+    const u8 lg = (u8)InterlockedCompareExchange(&p->motor_large, 0, 0);
+    const u8 sm = (u8)InterlockedCompareExchange(&p->motor_small, 0, 0);
+    const int led_now = InterlockedExchange(&p->led_dirty, 0);
+    /* Windows reports 547 for BT output (the 78-byte 0x31/0x11 report + zero
+     * padding, like hidapi); a 128-byte buffer silently skipped every BT write
+     * (play342: writes 0, no rumble). */
+    u8 r[1024];
+    DWORD len = p->out_len;
+    if (len == 0 || len > sizeof r) return;
+    memset(r, 0, sizeof r);
+
+    if (p->is_ds5) {
+        u8* c;
+        if (p->is_bt) {
+            if (len < 78) return;
+            r[0] = 0x31; r[1] = (u8)((p->out_seq++ & 0x0F) << 4); r[2] = 0x10;
+            c = r + 3;
+        } else { r[0] = 0x02; c = r + 1; }
+        c[0] = 0x03;                       /* compatible vibration + haptics select */
+        c[2] = sm; c[3] = lg;              /* right = weak, left = strong */
+        c[38] = 0x04;                      /* compatible vibration v2 (newer firmware) */
+        if (led_now) {
+            c[1]  = 0x04 | 0x10;           /* lightbar + player LEDs */
+            c[38] |= 0x02; c[41] = 0x02;   /* end the blue boot animation */
+            c[43] = ds5_player[pi];
+            c[44] = led[pi][0]; c[45] = led[pi][1]; c[46] = led[pi][2];
+        }
+        if (p->is_bt) {
+            u8 seed = 0xA2;
+            u32 crc = sony_crc32(&seed, 1, 0);
+            crc = sony_crc32(r, 74, crc);
+            r[74] = (u8)crc; r[75] = (u8)(crc >> 8); r[76] = (u8)(crc >> 16); r[77] = (u8)(crc >> 24);
+        }
+    } else {
+        u8* c;
+        if (p->is_bt) {
+            if (len < 78) return;
+            r[0] = 0x11; r[1] = 0xC0 | 0x04; r[3] = 0x07; c = r + 6;
+        } else { r[0] = 0x05; r[1] = 0x07; c = r + 4; }
+        c[0] = sm; c[1] = lg;
+        c[2] = led[pi][0]; c[3] = led[pi][1]; c[4] = led[pi][2];
+        if (p->is_bt) {
+            u8 seed = 0xA2;
+            u32 crc = sony_crc32(&seed, 1, 0);
+            crc = sony_crc32(r, 74, crc);
+            r[74] = (u8)crc; r[75] = (u8)(crc >> 8); r[76] = (u8)(crc >> 16); r[77] = (u8)(crc >> 24);
+        }
+    }
+
+    ResetEvent(ov->hEvent);
+    DWORD wr = 0;
+    const unsigned long long t0 = GetTickCount64();
+    int ok = 1;
+    if (!WriteFile(p->h, r, len, &wr, ov)) {
+        if (GetLastError() == ERROR_IO_PENDING) {
+            /* CancelIoEx on THIS write only: plain CancelIo would also kill
+             * the reader's pending ReadFile on the same handle. */
+            if (WaitForSingleObject(ov->hEvent, 100) != WAIT_OBJECT_0) CancelIoEx(p->h, ov);
+            ok = GetOverlappedResult(p->h, ov, &wr, TRUE);
+        } else ok = 0;
+    }
+    const unsigned dt = (unsigned)(GetTickCount64() - t0);
+    p->st_writes++;
+    if (!ok) p->st_wfail++;
+    if (dt > p->st_wmax) p->st_wmax = dt;
+    p->sent_large = lg; p->sent_small = sm;
+}
+
+/* Output reports get their own thread: a Bluetooth write can take tens of ms,
+ * and with rumble changing every frame in a match it starved the reader
+ * (play341: BT DualSense drove menus, nothing in a match). */
+static DWORD WINAPI sony_writer(LPVOID arg)
+{
+    SonyPad* p = (SonyPad*)arg;
+    OVERLAPPED wov;
+    memset(&wov, 0, sizeof wov);
+    wov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    sony_write(p, &wov);   /* lightbar on connect */
+    /* [#324g] Bluetooth: only the connect-time lightbar write. Rumble writes
+     * over BT stalled the link (play343: reports 400/s -> 11-76/s once rumble
+     * began; play344: a failed write, then a 14 s gap and no reports after,
+     * last state CROSS held). PAD_SONY_BT_RUMBLE=1 re-enables them. */
+    static int bt_rumble = -1;
+    if (bt_rumble < 0) bt_rumble = getenv("PAD_SONY_BT_RUMBLE") ? 1 : 0;
+    if (p->is_bt && !bt_rumble) {
+        while (!p->stop) WaitForSingleObject(p->wake, 500);
+        CloseHandle(wov.hEvent);
+        return 0;
+    }
+    while (!p->stop) {
+        WaitForSingleObject(p->wake, 500);
+        if (p->stop) break;
+        if (p->led_dirty || p->motor_large != p->sent_large || p->motor_small != p->sent_small)
+            sony_write(p, &wov);
+    }
+    CloseHandle(wov.hEvent);
+    return 0;
+}
+
+static DWORD WINAPI sony_reader(LPVOID arg)
+{
+    SonyPad* p = (SonyPad*)arg;
+    OVERLAPPED rov;
+    memset(&rov, 0, sizeof rov);
+    rov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    u8 buf[1024];
+    DWORD want = p->in_len ? p->in_len : 64;
+    if (want > sizeof buf) want = sizeof buf;
+    unsigned long long last_log = GetTickCount64();
+    unsigned n_full = 0, n_simple = 0, n_other = 0, max_gap = 0;
+    unsigned long long last_rpt = 0;
+    DWORD gle = 0;
+
+    while (!p->stop) {
+        ResetEvent(rov.hEvent);
+        DWORD n = 0;
+        if (!ReadFile(p->h, buf, want, &n, &rov) && (gle = GetLastError()) != ERROR_IO_PENDING) break;
+        while (!p->stop && WaitForSingleObject(rov.hEvent, 500) == WAIT_TIMEOUT) {}
+        if (p->stop) break;
+        if (!GetOverlappedResult(p->h, &rov, &n, FALSE)) { gle = GetLastError(); break; }   /* unplugged */
+        PadHostState s;
+        memset(&s, 0, sizeof s);
+        { const unsigned long long t = GetTickCount64();
+          if (last_rpt && t - last_rpt > max_gap) max_gap = (unsigned)(t - last_rpt);
+          last_rpt = t;
+          p->last_rpt_ms = t; }
+        if (n && (buf[0] == 0x31 || buf[0] == 0x11)) n_full++;
+        else if (n && buf[0] == 0x01) n_simple++;
+        else n_other++;
+        if (sony_parse(p, buf, n, &s)) {
+            AcquireSRWLockExclusive(&p->lock);
+            p->st = s; p->have_data = 1;
+            ReleaseSRWLockExclusive(&p->lock);
+        }
+        /* [#324e] stats every 10 s (diagnostic for BT; cheap) */
+        const unsigned long long now = GetTickCount64();
+        if (now - last_log >= 10000) {
+            printf("[cellPad] %s %s port %d: %u reports/10s (full %u, simple %u, other %u) "
+                   "max gap %u ms, writes %u fail %u max %u ms, btns 0x%04x\n",
+                   p->is_ds5 ? "DualSense" : "DualShock 4", p->is_bt ? "BT" : "USB", p->port,
+                   n_full + n_simple + n_other, n_full, n_simple, n_other, max_gap,
+                   p->st_writes, p->st_wfail, p->st_wmax, s.buttons);
+            fflush(stdout);
+            n_full = n_simple = n_other = 0; max_gap = 0;
+            p->st_writes = p->st_wfail = p->st_wmax = 0;
+            last_log = now;
+        }
+    }
+    if (!p->stop) { printf("[cellPad] reader stopped, error %lu\n", (unsigned long)gle); fflush(stdout); }
+    CancelIoEx(p->h, &rov);
+    { DWORD n; GetOverlappedResult(p->h, &rov, &n, TRUE); }
+    CloseHandle(rov.hEvent);
+    InterlockedExchange(&p->dead, 1);
+    return 0;
+}
+
+static int sony_ignored_by_steam(USHORT vid, USHORT pid)
+{
+    const char* e = getenv("SDL_GAMECONTROLLER_IGNORE_DEVICES");
+    if (!e || !*e) return 0;
+    char want[16];
+    snprintf(want, sizeof want, "0x%04x/0x%04x", vid, pid);
+    char low[1024]; size_t i = 0;
+    for (; e[i] && i < sizeof low - 1; i++) low[i] = (char)tolower((unsigned char)e[i]);
+    low[i] = 0;
+    return strstr(low, want) != NULL;
+}
+
+static int sony_path_is_candidate(const WCHAR* path)
+{
+    WCHAR low[512]; size_t i = 0;
+    for (; path[i] && i < 511; i++) low[i] = towlower(path[i]);
+    low[i] = 0;
+    if (!wcsstr(low, L"054c")) return 0;
+    static const WCHAR* pids[] = { L"05c4", L"09cc", L"0ba0", L"0ce6", L"0df2" };
+    for (int k = 0; k < 5; k++) {
+        WCHAR a[16], b[16];
+        swprintf(a, 16, L"pid_%ls", pids[k]);
+        swprintf(b, 16, L"pid&%ls", pids[k]);
+        if (wcsstr(low, a) || wcsstr(low, b)) return 1;
+    }
+    return 0;
+}
+
+static void sony_try_open(const WCHAR* path)
+{
+    for (int i = 0; i < SONY_MAX_PADS; i++)
+        if (s_sony[i].used && !wcscmp(s_sony[i].path, path)) return;   /* already ours */
+    int slot = -1;
+    for (int i = 0; i < SONY_MAX_PADS; i++) if (!s_sony[i].used) { slot = i; break; }
+    if (slot < 0) return;
+
+    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;   /* exclusively owned (DS4Windows) or gone */
+
+    HIDD_ATTRIBUTES at; memset(&at, 0, sizeof at); at.Size = sizeof at;
+    PHIDP_PREPARSED_DATA pp = NULL; HIDP_CAPS caps; memset(&caps, 0, sizeof caps);
+    int ok = HidD_GetAttributes(h, &at) && at.VendorID == 0x054C &&
+             HidD_GetPreparsedData(h, &pp) && HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS &&
+             caps.UsagePage == 0x01 && caps.Usage == 0x05;
+    if (pp) HidD_FreePreparsedData(pp);
+    int ds5 = at.ProductID == 0x0CE6 || at.ProductID == 0x0DF2;
+    int ds4 = at.ProductID == 0x05C4 || at.ProductID == 0x09CC || at.ProductID == 0x0BA0;
+    if (!ok || (!ds5 && !ds4) || sony_ignored_by_steam(at.VendorID, at.ProductID)) {
+        static int said_steam = 0;
+        if (ok && !said_steam && sony_ignored_by_steam(at.VendorID, at.ProductID)) {
+            said_steam = 1;
+            printf("[cellPad] Sony pad %04x:%04x left to Steam Input\n", at.VendorID, at.ProductID);
+            fflush(stdout);
+        }
+        CloseHandle(h);
+        return;
+    }
+
+    SonyPad* p = &s_sony[slot];
+    memset(p, 0, sizeof *p);
+    InitializeSRWLock(&p->lock);
+    p->h = h;
+    wcsncpy(p->path, path, 511);
+    p->is_ds5  = ds5;
+    p->in_len  = caps.InputReportByteLength;
+    p->out_len = caps.OutputReportByteLength;
+    p->is_bt   = caps.InputReportByteLength > 64 || wcsstr(p->path, L"00001124") != NULL;
+    p->port    = -1;
+    p->sent_large = p->sent_small = -1;
+    p->led_dirty = 1;
+
+    if (p->is_bt) {
+        /* Reading the calibration feature report switches the pad from the
+         * short BT report to the full one (0x11 DS4 / 0x31 DualSense). */
+        u8 f[1024]; memset(f, 0, sizeof f);
+        f[0] = ds5 ? 0x05 : 0x02;
+        ULONG fl = caps.FeatureReportByteLength ? caps.FeatureReportByteLength : 64;
+        if (fl > sizeof f) fl = sizeof f;
+        HidD_GetFeature(h, f, fl);
+    }
+
+    p->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    InterlockedExchange(&p->used, 1);
+    /* [#324f] Latency: keep only the 2 newest reports in the driver queue, and
+     * run the reader time-critical (it sleeps on I/O almost all the time).
+     * play342: under game load the reader got 15-100 of ~250 reports/s and the
+     * default 32-report queue served input up to ~2 s old ("kept skating after
+     * I let go", missed line changes). */
+    HidD_SetNumInputBuffers(h, 2);
+    p->thread = CreateThread(NULL, 0, sony_reader, p, 0, NULL);
+    if (p->thread) SetThreadPriority(p->thread, THREAD_PRIORITY_TIME_CRITICAL);
+    p->wthread = CreateThread(NULL, 0, sony_writer, p, 0, NULL);
+    printf("[cellPad] %s (%s) connected (in %u out %u feat %u)\n", ds5 ? "DualSense" : "DualShock 4",
+           p->is_bt ? "Bluetooth" : "USB", caps.InputReportByteLength,
+           caps.OutputReportByteLength, caps.FeatureReportByteLength);
+    fflush(stdout);
+}
+
+static void sony_reap(SonyPad* p)
+{
+    InterlockedExchange(&p->stop, 1);
+    if (p->wake) SetEvent(p->wake);
+    if (p->thread) { WaitForSingleObject(p->thread, 2000); CloseHandle(p->thread); }
+    if (p->wthread) { WaitForSingleObject(p->wthread, 2000); CloseHandle(p->wthread); }
+    if (p->h && p->h != INVALID_HANDLE_VALUE) CloseHandle(p->h);
+    if (p->wake) CloseHandle(p->wake);
+    printf("[cellPad] %s disconnected\n", p->is_ds5 ? "DualSense" : "DualShock 4");
+    fflush(stdout);
+    p->h = NULL; p->thread = NULL; p->wake = NULL;
+    InterlockedExchange(&p->used, 0);
+}
+
+static DWORD WINAPI sony_hotplug(LPVOID arg)
+{
+    (void)arg;
+    GUID g; HidD_GetHidGuid(&g);
+    while (!s_sony_stop) {
+        for (int i = 0; i < SONY_MAX_PADS; i++)
+            if (s_sony[i].used && s_sony[i].dead) sony_reap(&s_sony[i]);
+
+        HDEVINFO di = SetupDiGetClassDevsW(&g, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (di != INVALID_HANDLE_VALUE) {
+            SP_DEVICE_INTERFACE_DATA ifd; ifd.cbSize = sizeof ifd;
+            for (DWORD k = 0; SetupDiEnumDeviceInterfaces(di, NULL, &g, k, &ifd); k++) {
+                union { SP_DEVICE_INTERFACE_DETAIL_DATA_W d; u8 raw[sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) + 1024]; } u;
+                u.d.cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+                if (!SetupDiGetDeviceInterfaceDetailW(di, &ifd, &u.d, sizeof u, NULL, NULL)) continue;
+                if (sony_path_is_candidate(u.d.DevicePath)) sony_try_open(u.d.DevicePath);
+            }
+            SetupDiDestroyDeviceInfoList(di);
+        }
+        for (int t = 0; t < 20 && !s_sony_stop; t++) Sleep(100);
+    }
+    return 0;
+}
+
+static int sony_enabled(void)
+{
+    if (getenv("PAD_NO_SONY_HID")) return 0;
+    if (getenv("PAD_SONY_HID")) return 1;
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+    if (nt && GetProcAddress(nt, "wine_get_version")) return 0;   /* Proton: leave to wine */
+    return 1;
+}
+
+/* After XInput: give each Sony pad a port XInput left empty. */
+static void pad_merge_sony(void)
+{
+    if (!s_sony_hotplug) return;
+    int taken[PAD_MAX_HOST_PORTS];
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) taken[i] = s_host_state[i].connected;
+
+    /* Pads already on a port keep it; only new ones (or ones whose port
+     * XInput took) pick a free port. Without this pass a pad re-plugged into
+     * a lower s_sony slot stole port 0 from the pad playing on it (play338). */
+    for (int i = 0; i < SONY_MAX_PADS; i++) {
+        SonyPad* p = &s_sony[i];
+        if (p->used && !p->dead && p->port >= 0) {
+            if (taken[p->port]) p->port = -1;   /* XInput claimed it */
+            else taken[p->port] = 2;            /* held by this Sony pad */
+        }
+    }
+
+    for (int i = 0; i < SONY_MAX_PADS; i++) {
+        SonyPad* p = &s_sony[i];
+        if (!p->used || p->dead) { if (!p->used) p->port = -1; continue; }
+        /* Move down to a lower free port (e.g. player 1 unplugged): the game
+         * drives a match from port 0, so a lone pad stuck on port 1 played
+         * menus only (play337, DS4 red light). */
+        int low = -1;
+        for (int k = 0; k < PAD_MAX_HOST_PORTS; k++) if (!taken[k]) { low = k; break; }
+        if (low >= 0 && (p->port < 0 || low < p->port)) {
+            if (p->port >= 0) {
+                memset(&s_host_state[p->port], 0, sizeof(PadHostState));
+                taken[p->port] = 0;
+            }
+            p->port = low;
+            InterlockedExchange(&p->led_dirty, 1);
+            SetEvent(p->wake);
+            printf("[cellPad] %s on port %d\n", p->is_ds5 ? "DualSense" : "DualShock 4", p->port);
+            fflush(stdout);
+        }
+        if (p->port < 0) continue;
+        taken[p->port] = 1;
+        /* [#324g] No report for 500 ms (BT dropout): neutral, not the last
+         * state -- a stale held stick/button is what made players drift. */
+        const int stale = p->last_rpt_ms && GetTickCount64() - p->last_rpt_ms > 500;
+        AcquireSRWLockShared(&p->lock);
+        if (p->have_data && !stale) s_host_state[p->port] = p->st;
+        else { memset(&s_host_state[p->port], 0, sizeof(PadHostState));
+               s_host_state[p->port].connected = 1;
+               s_host_state[p->port].analog_lx = s_host_state[p->port].analog_ly = 128;
+               s_host_state[p->port].analog_rx = s_host_state[p->port].analog_ry = 128; }
+        ReleaseSRWLockShared(&p->lock);
+    }
+}
+
+/* Returns 1 if a Sony pad owns host port `port` (rumble routed there). */
+static int sony_rumble(u32 port, u8 large, u8 small)
+{
+    for (int i = 0; i < SONY_MAX_PADS; i++) {
+        SonyPad* p = &s_sony[i];
+        if (p->used && !p->dead && p->port == (int)port) {
+            InterlockedExchange(&p->motor_large, large);
+            InterlockedExchange(&p->motor_small, small);
+            if (large != p->sent_large || small != p->sent_small) SetEvent(p->wake);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void pad_init_backend(void)
 {
     /* XInput needs no explicit init */
+    if (!s_sony_hotplug && sony_enabled()) {
+        s_sony_stop = 0;
+        s_sony_hotplug = CreateThread(NULL, 0, sony_hotplug, NULL, 0, NULL);
+    }
 }
 
 static void pad_shutdown_backend(void)
 {
-    /* XInput needs no explicit shutdown */
+    if (s_sony_hotplug) {
+        InterlockedExchange(&s_sony_stop, 1);
+        WaitForSingleObject(s_sony_hotplug, 3000);
+        CloseHandle(s_sony_hotplug);
+        s_sony_hotplug = NULL;
+        for (int i = 0; i < SONY_MAX_PADS; i++) if (s_sony[i].used) sony_reap(&s_sony[i]);
+    }
 }
 
 #endif /* PAD_BACKEND_XINPUT */
@@ -454,6 +984,7 @@ static void pad_poll_backend(void)
 
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
+    pad_merge_sony();
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
@@ -484,7 +1015,6 @@ s32 cellPadInit(u32 max_connect)
     s_max_connect = max_connect > CELL_PAD_MAX_PORT_NUM ? CELL_PAD_MAX_PORT_NUM : max_connect;
     memset(s_port_setting, 0, sizeof(s_port_setting));
     memset(s_host_state, 0, sizeof(s_host_state));
-
     pad_init_backend();
 
     /* Do an initial poll to detect connected controllers */
@@ -1091,7 +1621,11 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 
 #if PAD_BACKEND_XINPUT
     /* Map to XInput vibration */
-    if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].connected) {
+    if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].connected &&
+        !sony_rumble(port_no, param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE],
+                     param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] > 1
+                         ? param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL]
+                         : (u8)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] ? 255 : 0))) {
         XINPUT_VIBRATION vib;
         vib.wLeftMotorSpeed  = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257);
         vib.wRightMotorSpeed = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257);

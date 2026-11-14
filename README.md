@@ -40,6 +40,11 @@ Join our discord! https://discord.gg/UU9bpt4Qmx
   art and even loudness. The launcher rebuilds the music bank when you press PLAY.
 - **Audio packs** (v1.0.1): share playlists plus your Custom Audio choices as one
   `.nhlaudio` file; dropping one on the launcher installs it.
+- **PlayStation controllers** (v1.0.2): the PS5 DualSense and PS4 DualShock 4 work
+  natively, without Steam Input or DS4Windows. A small raw-HID reader in `cellPad.c`
+  handles USB and Bluetooth, rumble and the player-colour light bar, merged with
+  XInput pads. A pad that Steam Input already handles is left to Steam. USB is
+  recommended: Bluetooth quality depends on the PC (`tools/padprobe.c` measures it).
 
 ### Graphics options (beyond the PS3)
 | Option | Choices |
@@ -88,7 +93,10 @@ Join our discord! https://discord.gg/UU9bpt4Qmx
     in place of the lifted SPU loops (v1.0.1).
 - **Rendering fixes found by diffing against RPCS3's shader logs**, for example:
   - the goal light (the vertex-program `RSQ(0)` must give infinity);
-  - lineup team-colour bars and dark text panels (Apt colour-transform add term).
+  - lineup team-colour bars and dark text panels (Apt colour-transform add term);
+  - player shadows (v1.0.2): the shadow-map compare runs in RSX order
+    (`depth FUNC reference`), and the shadow pass applies the game's polygon-offset
+    slope bias. This removes the "wavy" self-shadowing on jerseys.
 
 ---
 
