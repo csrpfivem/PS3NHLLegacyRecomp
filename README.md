@@ -48,6 +48,12 @@ Join our discord! https://discord.gg/UU9bpt4Qmx
 - **Every other controller** (v1.0.2): Switch Pro, DualShock 3, and generic or older
   pads go through SDL3's gamepad database. `SDL3.dll` is loaded at run time from the
   exe's folder; without it the game runs as before.
+- **Up to 7 controllers, all through SDL3** (v1.0.3): SDL3 now drives every pad
+  (Xbox, DualSense, DS4 and the rest) on all 7 PS3 ports, with light bars in the
+  game's player colours. If SDL3 can't load, the v1.0.2 XInput + raw-HID path takes
+  over; `PAD_LEGACY=1` forces it. Wine/Proton (Steam Deck) stays on XInput.
+- **Keyboard** (v1.0.3): WASD skates, arrows drive the d-pad, K/L/J/I are the face
+  buttons. Keys come from the game window's own messages, not a global key poll.
 
 ### Graphics options (beyond the PS3)
 | Option | Choices |

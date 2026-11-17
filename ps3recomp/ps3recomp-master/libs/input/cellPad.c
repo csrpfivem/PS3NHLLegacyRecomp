@@ -54,7 +54,16 @@
  * Internal state
  * -----------------------------------------------------------------------*/
 
-#define PAD_MAX_HOST_PORTS  4  /* XInput supports max 4; SDL may support more */
+/* [NHL #326] All 7 PS3 ports (was 4, the XInput slot count): issue #5, five
+ * pads connected and the 5th never got a port. XInput itself still only has
+ * slots 0-3 (pad_poll_xinput); ports 4-6 are filled by SDL / Sony pads. */
+#define PAD_MAX_HOST_PORTS  7
+#define PAD_XINPUT_SLOTS    4
+
+/* [NHL #326] 1 = SDL3 drives every controller (default on Windows when
+ * SDL3.dll loads); 0 = the old XInput + #324 Sony HID + #325 SDL-fallback
+ * path (PAD_LEGACY=1, no SDL3.dll, or Wine/Proton). */
+static int s_pad_sdl_primary = 0;
 
 typedef struct {
     int  connected;
@@ -130,10 +139,27 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
  * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
  * disable it entirely.
  *
- * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
- * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
- * so a title that reads the stick instead is playable too. */
+ * #327c layout: WASD = left stick, arrows = d-pad, K/L/J/I = cross/circle/
+ * square/triangle (Z/X also cross/circle), Q/E = L1/R1, 1/2 = L2/R2,
+ * Enter = START, Tab = SELECT. The arrows no longer mirror onto the stick. */
 #ifdef _WIN32
+/* [NHL #327] Key state comes from the game window's own WM_KEYDOWN/WM_KEYUP
+ * (rsx_d3d12_backend.c wndproc), cleared on WM_KILLFOCUS. It used to be a
+ * GetAsyncKeyState poll of 14 keys every 4 ms, which is the textbook
+ * keylogger pattern antivirus heuristics score (issue #6). */
+static volatile LONG s_host_keys[256];
+
+void cellPad_host_key(unsigned vk, int down, unsigned msg_time)
+{
+    (void)msg_time;   /* play354: delivery lag measured, never > 50 ms */
+    if (vk < 256) InterlockedExchange(&s_host_keys[vk], down ? 1 : 0);
+}
+
+void cellPad_host_keys_clear(void)
+{
+    for (int i = 0; i < 256; i++) InterlockedExchange(&s_host_keys[i], 0);
+}
+
 static int pad_host_window_focused(void)
 {
     HWND fg = GetForegroundWindow();
@@ -163,23 +189,35 @@ static void pad_poll_keyboard(void)
     static const struct { int vk; u16 btn; } map[] = {
         { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
         { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
+        /* #327c: WASD = left stick (below); face buttons moved to the
+         * I/J/K/L diamond, Z/X kept as Cross/Circle, R1 moved W -> E */
         { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
-        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
-        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
+        { 'K',       CELL_PAD_CTRL_CROSS },   { 'L',      CELL_PAD_CTRL_CIRCLE },
+        { 'J',       CELL_PAD_CTRL_SQUARE },  { 'I',      CELL_PAD_CTRL_TRIANGLE },
+        { 'Q',       CELL_PAD_CTRL_L1 },      { 'E',      CELL_PAD_CTRL_R1 },
         { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
         { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
     };
 
     u16 btns = 0;
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
-        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
+        if (s_host_keys[map[i].vk & 0xFF]) btns |= map[i].btn;
 
     hs->buttons   = btns;
     hs->connected = 1;
-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
+    /* #327c: the left stick has its own keys, WASD (user's choice). The
+     * arrows used to push the stick too, and NHL's menus count d-pad and
+     * stick separately, so each tap moved two items (play354 skipped;
+     * play355 with the arrows on the d-pad only: fixed).
+     * PAD_KB_ARROW_STICK=1 brings back the old mirroring for other titles. */
+    static int arrow_stick = -1;
+    if (arrow_stick < 0) arrow_stick = getenv("PAD_KB_ARROW_STICK") ? 1 : 0;
+    const int sl = s_host_keys['A'] || (arrow_stick && (btns & CELL_PAD_CTRL_LEFT));
+    const int sr = s_host_keys['D'] || (arrow_stick && (btns & CELL_PAD_CTRL_RIGHT));
+    const int su = s_host_keys['W'] || (arrow_stick && (btns & CELL_PAD_CTRL_UP));
+    const int sd = s_host_keys['S'] || (arrow_stick && (btns & CELL_PAD_CTRL_DOWN));
+    hs->analog_lx = (u8)(sl && !sr ? 0 : sr && !sl ? 255 : 128);
+    hs->analog_ly = (u8)(su && !sd ? 0 : sd && !su ? 255 : 128);
     hs->analog_rx = hs->analog_ry = 128;
     hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
     hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
@@ -193,7 +231,7 @@ static void pad_poll_keyboard(void)
 
 static void pad_poll_xinput(void)
 {
-    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+    for (int i = 0; i < PAD_XINPUT_SLOTS; i++) {
         XINPUT_STATE state;
         memset(&state, 0, sizeof(state));
 
@@ -279,7 +317,15 @@ static void pad_poll_xinput(void)
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
 
-#define SONY_MAX_PADS 4
+#define SONY_MAX_PADS 7   /* #326: was 4 */
+
+/* [NHL #326b] Lightbar colour per PS3 port = the game's own player colours
+ * (select-sides screen, user-read play351): P1 red, P2 blue, P3 green,
+ * P4 yellow, P5 turquoise, P6 purple, P7 orange. Used by the SDL path and
+ * the legacy #324 reader alike. */
+static const u8 s_player_rgb[7][3] = {
+    {255,   0,   0}, {  0,  40, 255}, {  0, 255,   0}, {255, 200,   0},
+    {  0, 220, 200}, {150,   0, 255}, {255,  90,   0} };
 
 typedef struct {
     volatile LONG  used;          /* slot owned by a live device */
@@ -399,9 +445,9 @@ static int sony_parse(SonyPad* p, const u8* b, DWORD n, PadHostState* o)
 
 static void sony_write(SonyPad* p, OVERLAPPED* ov)
 {
-    static const u8 led[4][3] = { {0,0,64}, {64,0,0}, {0,64,0}, {64,0,40} };  /* PS player colours */
     static const u8 ds5_player[4] = { 0x04, 0x0A, 0x15, 0x1B };
-    const int pi = (p->port >= 0 && p->port < 4) ? p->port : 0;
+    const int pi = p->port >= 0 ? p->port % 4 : 0;   /* #326: player-LED dots for ports 4-6 wrap */
+    const u8* rgb = s_player_rgb[(p->port >= 0 && p->port < 7) ? p->port : 0];   /* #326b */
     const u8 lg = (u8)InterlockedCompareExchange(&p->motor_large, 0, 0);
     const u8 sm = (u8)InterlockedCompareExchange(&p->motor_small, 0, 0);
     const int led_now = InterlockedExchange(&p->led_dirty, 0);
@@ -427,7 +473,7 @@ static void sony_write(SonyPad* p, OVERLAPPED* ov)
             c[1]  = 0x04 | 0x10;           /* lightbar + player LEDs */
             c[38] |= 0x02; c[41] = 0x02;   /* end the blue boot animation */
             c[43] = ds5_player[pi];
-            c[44] = led[pi][0]; c[45] = led[pi][1]; c[46] = led[pi][2];
+            c[44] = rgb[0]; c[45] = rgb[1]; c[46] = rgb[2];
         }
         if (p->is_bt) {
             u8 seed = 0xA2;
@@ -442,7 +488,7 @@ static void sony_write(SonyPad* p, OVERLAPPED* ov)
             r[0] = 0x11; r[1] = 0xC0 | 0x04; r[3] = 0x07; c = r + 6;
         } else { r[0] = 0x05; r[1] = 0x07; c = r + 4; }
         c[0] = sm; c[1] = lg;
-        c[2] = led[pi][0]; c[3] = led[pi][1]; c[4] = led[pi][2];
+        c[2] = rgb[0]; c[3] = rgb[1]; c[4] = rgb[2];
         if (p->is_bt) {
             u8 seed = 0xA2;
             u32 crc = sony_crc32(&seed, 1, 0);
@@ -723,7 +769,12 @@ static int sony_enabled(void)
  *    bottom = Cross, right = Circle, left = Square, top = Triangle.
  *  - Off under Wine/Proton (PAD_SDL=1 forces on), PAD_NO_SDL=1 disables.
  * -----------------------------------------------------------------------*/
-#define SDLP_MAX 4
+/* [NHL #326] SDL-primary mode (s_pad_sdl_primary): the same thread drives
+ * EVERY pad -- Xbox (SDL's RawInput/XInput/WGI backends, no 4-slot limit),
+ * DualSense/DS4 (SDL's HIDAPI drivers: rumble, lightbar, player LEDs), and
+ * the rest. XInput polling and the #324 reader stay off. cellPadInit waits
+ * for the first device scan, and falls back to the old path if SDL3 fails. */
+#define SDLP_MAX 8   /* #326: was 4; more slots than the 7 ports */
 
 typedef struct {
     int            used;          /* written by the SDL thread only */
@@ -737,12 +788,16 @@ typedef struct {
     volatile LONG  motor_large, motor_small;
     int            sent_large, sent_small;
     unsigned long long rumble_ms;
+    volatile LONG  want_player;   /* #326: port -> SDL player index (LEDs) */
+    int            sent_player;
     char           name[64];
 } SdlPad;
 
 static SdlPad         s_sdlp[SDLP_MAX];
 static HANDLE         s_sdl_thread = NULL;
 static volatile LONG  s_sdl_stop = 0;
+static HANDLE         s_sdl_ready = NULL;    /* #326: set after init + first scan, or on failure */
+static volatile LONG  s_sdl_ok = 0;
 
 typedef int            (__cdecl *PFN_SDL_Init)(unsigned);
 typedef void           (__cdecl *PFN_SDL_Quit)(void);
@@ -760,6 +815,8 @@ typedef int            (__cdecl *PFN_SDL_GetGamepadButton)(void*, int);
 typedef short          (__cdecl *PFN_SDL_GetGamepadAxis)(void*, int);
 typedef int            (__cdecl *PFN_SDL_RumbleGamepad)(void*, unsigned short, unsigned short, unsigned);
 typedef const char*    (__cdecl *PFN_SDL_GetError)(void);
+typedef int            (__cdecl *PFN_SDL_SetGamepadPlayerIndex)(void*, int);
+typedef int            (__cdecl *PFN_SDL_SetGamepadLED)(void*, unsigned char, unsigned char, unsigned char);
 
 static struct {
     PFN_SDL_Init Init; PFN_SDL_Quit Quit; PFN_SDL_SetHint SetHint;
@@ -769,6 +826,8 @@ static struct {
     PFN_SDL_OpenGamepad OpenGamepad; PFN_SDL_CloseGamepad CloseGamepad;
     PFN_SDL_GamepadConnected GamepadConnected; PFN_SDL_GetGamepadButton GetGamepadButton;
     PFN_SDL_GetGamepadAxis GetGamepadAxis; PFN_SDL_RumbleGamepad RumbleGamepad; PFN_SDL_GetError GetError;
+    PFN_SDL_SetGamepadPlayerIndex SetGamepadPlayerIndex;
+    PFN_SDL_SetGamepadLED SetGamepadLED;
 } S3;
 
 /* SDL3 enum values (SDL_gamepad.h, stable ABI since 3.2.0) */
@@ -793,7 +852,7 @@ static int sdl_load(void)
     S3P(Init); S3P(Quit); S3P(SetHint); S3P(SetGamepadEventsEnabled); S3P(UpdateGamepads);
     S3P(GetGamepads); S3P(GetGamepadTypeForID); S3P(GetGamepadNameForID); S3P(OpenGamepad);
     S3P(CloseGamepad); S3P(GamepadConnected); S3P(GetGamepadButton); S3P(GetGamepadAxis);
-    S3P(RumbleGamepad); S3P(GetError);
+    S3P(RumbleGamepad); S3P(GetError); S3P(SetGamepadPlayerIndex); S3P(SetGamepadLED);
 #undef S3P
     S3.free_ = (PFN_SDL_free)(void*)GetProcAddress(m, "SDL_free");
     if (!S3.Init || !S3.SetHint || !S3.SetGamepadEventsEnabled || !S3.UpdateGamepads || !S3.GetGamepads ||
@@ -808,6 +867,7 @@ static int sdl_load(void)
 
 static int sdl_skip_type(int type)
 {
+    if (s_pad_sdl_primary) return 0;                                    /* #326: SDL owns all */
     if (type == ST_XBOX360 || type == ST_XBOXONE) return 1;            /* XInput's */
     if ((type == ST_PS4 || type == ST_PS5) && s_sony_hotplug) return 1; /* #324's */
     return 0;
@@ -871,28 +931,36 @@ static void sdl_read(SdlPad* p)
 static DWORD WINAPI sdl_thread(LPVOID arg)
 {
     (void)arg;
-    if (!sdl_load()) { printf("[cellPad] no SDL3.dll beside the exe; other-controller fallback off\n");
-                       fflush(stdout); return 0; }
+    if (!sdl_load()) { printf("[cellPad] no SDL3.dll beside the exe; SDL controller path off\n");
+                       fflush(stdout); if (s_sdl_ready) SetEvent(s_sdl_ready); return 0; }
     S3.SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
-    S3.SetHint("SDL_JOYSTICK_HIDAPI_XBOX", "0");
-    if (s_sony_hotplug) {   /* #324 owns these: SDL must not open or write to them */
-        S3.SetHint("SDL_JOYSTICK_HIDAPI_PS4", "0");
-        S3.SetHint("SDL_JOYSTICK_HIDAPI_PS5", "0");
+    if (!s_pad_sdl_primary) {
+        /* Fallback mode: XInput owns Xbox pads, #324 owns PS4/PS5. In primary
+         * mode (#326) SDL keeps its own defaults for all of them. */
+        S3.SetHint("SDL_JOYSTICK_HIDAPI_XBOX", "0");
+        if (s_sony_hotplug) {   /* #324 owns these: SDL must not open or write to them */
+            S3.SetHint("SDL_JOYSTICK_HIDAPI_PS4", "0");
+            S3.SetHint("SDL_JOYSTICK_HIDAPI_PS5", "0");
+        }
     }
     if (!S3.Init(SDL3_INIT_GAMEPAD)) {
         printf("[cellPad] SDL3 init failed: %s\n", S3.GetError ? S3.GetError() : "?");
         fflush(stdout);
+        if (s_sdl_ready) SetEvent(s_sdl_ready);
         return 0;
     }
     S3.SetGamepadEventsEnabled(0);   /* we call SDL_UpdateGamepads ourselves */
-    printf("[cellPad] SDL3 controller fallback ready\n");
+    InterlockedExchange(&s_sdl_ok, 1);
+    printf("[cellPad] SDL3 %s ready\n", s_pad_sdl_primary ? "controller input (all pads)" : "controller fallback");
     fflush(stdout);
 
     HANDLE tm = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     unsigned long long last_scan = 0;
+    int first_pass = 1;
     while (!s_sdl_stop) {
-        if (tm) { LARGE_INTEGER due; due.QuadPart = -40000; SetWaitableTimer(tm, &due, 0, NULL, NULL, FALSE);
-                  WaitForSingleObject(tm, 50); }
+        if (first_pass) { /* no wait: cellPadInit is blocked on the first scan */ }
+        else if (tm) { LARGE_INTEGER due; due.QuadPart = -40000; SetWaitableTimer(tm, &due, 0, NULL, NULL, FALSE);
+                       WaitForSingleObject(tm, 50); }
         else Sleep(4);
         S3.UpdateGamepads();
         const unsigned long long now = GetTickCount64();
@@ -929,6 +997,8 @@ static DWORD WINAPI sdl_thread(LPVOID arg)
                 p->sent_large = p->sent_small = 0; p->rumble_ms = 0;
                 InterlockedExchange(&p->motor_large, 0);
                 InterlockedExchange(&p->motor_small, 0);
+                InterlockedExchange(&p->want_player, -1);
+                p->sent_player = -2;
                 const char* nm = S3.GetGamepadNameForID(ids[k]);
                 snprintf(p->name, sizeof p->name, "%s", nm ? nm : "controller");
                 p->used = 1;
@@ -943,6 +1013,17 @@ static DWORD WINAPI sdl_thread(LPVOID arg)
             SdlPad* p = &s_sdlp[i];
             if (!p->used) continue;
             sdl_read(p);
+            /* #326: player index = PS3 port, so DualSense/DS4 player LEDs and
+             * lightbar (and Xbox/Switch indicators) match the in-game slot */
+            { const int wp = (int)p->want_player;
+              if (wp != p->sent_player && S3.SetGamepadPlayerIndex) {
+                  S3.SetGamepadPlayerIndex(p->gp, wp);
+                  /* #326b: then the game's colour for that player (SDL's own
+                   * table is the PS4 one: blue, red, green, pink) */
+                  if (S3.SetGamepadLED && wp >= 0 && wp < 7)
+                      S3.SetGamepadLED(p->gp, s_player_rgb[wp][0], s_player_rgb[wp][1], s_player_rgb[wp][2]);
+                  p->sent_player = wp;
+              } }
             const int lg = (int)p->motor_large, sm = (int)p->motor_small;
             if (S3.RumbleGamepad && (lg != p->sent_large || sm != p->sent_small ||
                                      ((lg || sm) && now - p->rumble_ms > 500))) {
@@ -950,6 +1031,7 @@ static DWORD WINAPI sdl_thread(LPVOID arg)
                 p->sent_large = lg; p->sent_small = sm; p->rumble_ms = now;
             }
         }
+        if (first_pass) { first_pass = 0; if (s_sdl_ready) SetEvent(s_sdl_ready); }
     }
     for (int i = 0; i < SDLP_MAX; i++)
         if (s_sdlp[i].used) { InterlockedExchange(&s_sdlp[i].live, 0); S3.CloseGamepad(s_sdlp[i].gp); s_sdlp[i].used = 0; }
@@ -991,12 +1073,17 @@ static void pad_merge_sdl(int* taken)
         for (int k = 0; k < PAD_MAX_HOST_PORTS; k++) if (!taken[k]) { low = k; break; }
         if (low >= 0 && (p->port < 0 || low < p->port)) {
             if (p->port >= 0) { memset(&s_host_state[p->port], 0, sizeof(PadHostState)); taken[p->port] = 0; }
-            p->port = low;
-            printf("[cellPad] %s on port %d\n", p->name, p->port);
-            fflush(stdout);
+            p->port = low;   /* #326: want_player (LEDs) syncs just below */
         }
         if (p->port < 0) continue;
         taken[p->port] = 1;
+        /* #326b: a pad found by the first scan sits in a zero-initialised slot
+         * (port 0) and never takes the branch above, so sync here too */
+        if (p->want_player != p->port) {
+            InterlockedExchange(&p->want_player, p->port);
+            printf("[cellPad] %s on port %d\n", p->name, p->port);
+            fflush(stdout);
+        }
         AcquireSRWLockShared(&p->lock);
         if (p->have_data) s_host_state[p->port] = p->st;
         else { memset(&s_host_state[p->port], 0, sizeof(PadHostState));
@@ -1012,8 +1099,11 @@ static void pad_merge_sony(int* taken);
 static void pad_merge_ext(void)
 {
     if (!s_sony_hotplug && !s_sdl_thread) return;
+    /* XInput's slots count as taken in the old mode. In SDL-primary mode
+     * nothing is pre-taken (port 0's keyboard fallback never blocks a pad). */
     int taken[PAD_MAX_HOST_PORTS];
-    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) taken[i] = s_host_state[i].connected;
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
+        taken[i] = !s_pad_sdl_primary && i < PAD_XINPUT_SLOTS && s_host_state[i].connected;
 
     /* Pads already on a port keep it; only new ones (or ones whose port
      * XInput took) pick a free port. Without this pass a pad re-plugged into
@@ -1034,6 +1124,14 @@ static void pad_merge_ext(void)
     }
     if (s_sony_hotplug) pad_merge_sony(taken);
     if (s_sdl_thread)   pad_merge_sdl(taken);
+
+    /* #326: a port no device holds any more reads disconnected. XInput resets
+     * its own slots each poll; ports above them (and every port in SDL-primary
+     * mode) only get cleared here. Owned ports are never zeroed, so a port
+     * the game is reading never flickers to disconnected. */
+    for (int k = 0; k < PAD_MAX_HOST_PORTS; k++)
+        if (!taken[k] && (s_pad_sdl_primary || k >= PAD_XINPUT_SLOTS))
+            memset(&s_host_state[k], 0, sizeof(PadHostState));
 }
 
 static void pad_merge_sony(int* taken)
@@ -1087,9 +1185,49 @@ static int sony_rumble(u32 port, u8 large, u8 small)
     return 0;
 }
 
+/* #326: SDL3 as the only controller path, unless PAD_LEGACY=1 / PAD_NO_SDL=1,
+ * or under Wine/Proton (the Deck stays on XInput via wine; PAD_SDL=1 forces). */
+static int sdl_primary_wanted(void)
+{
+    if (getenv("PAD_LEGACY")) return 0;
+    return sdl_enabled();
+}
+
 static void pad_init_backend(void)
 {
-    /* XInput needs no explicit init */
+    if (!s_sdl_thread && !s_sony_hotplug && sdl_primary_wanted()) {
+        s_pad_sdl_primary = 1;
+        InterlockedExchange(&s_sdl_ok, 0);
+        s_sdl_stop = 0;
+        s_sdl_ready = CreateEventW(NULL, TRUE, FALSE, NULL);
+        s_sdl_thread = CreateThread(NULL, 0, sdl_thread, NULL, 0, NULL);
+        if (s_sdl_thread) {
+            SetThreadPriority(s_sdl_thread, THREAD_PRIORITY_TIME_CRITICAL);
+            /* init + first device scan; SDL3 normally needs well under 1 s */
+            if (s_sdl_ready) WaitForSingleObject(s_sdl_ready, 5000);
+        }
+        if (s_sdl_thread && s_sdl_ok) {
+            printf("[cellPad] input: SDL3 (all controllers; PAD_LEGACY=1 for the old path)\n");
+            fflush(stdout);
+            return;
+        }
+        /* SDL3 missing or failed: fall back to XInput + the #324 Sony reader */
+        printf("[cellPad] input: SDL3 unavailable, using XInput + Sony HID\n");
+        fflush(stdout);
+        s_pad_sdl_primary = 0;
+        if (s_sdl_thread) {
+            InterlockedExchange(&s_sdl_stop, 1);
+            WaitForSingleObject(s_sdl_thread, 3000);
+            CloseHandle(s_sdl_thread);
+            s_sdl_thread = NULL;
+        }
+        if (s_sony_hotplug == NULL && sony_enabled()) {
+            s_sony_stop = 0;
+            s_sony_hotplug = CreateThread(NULL, 0, sony_hotplug, NULL, 0, NULL);
+        }
+        return;   /* SDL already failed; no point starting it as a fallback */
+    }
+    /* Old path (PAD_LEGACY=1, Wine/Proton): XInput needs no explicit init */
     if (!s_sony_hotplug && sony_enabled()) {
         s_sony_stop = 0;
         s_sony_hotplug = CreateThread(NULL, 0, sony_hotplug, NULL, 0, NULL);
@@ -1110,6 +1248,8 @@ static void pad_shutdown_backend(void)
         CloseHandle(s_sdl_thread);
         s_sdl_thread = NULL;
     }
+    if (s_sdl_ready) { CloseHandle(s_sdl_ready); s_sdl_ready = NULL; }
+    s_pad_sdl_primary = 0;
     if (s_sony_hotplug) {
         InterlockedExchange(&s_sony_stop, 1);
         WaitForSingleObject(s_sony_hotplug, 3000);
@@ -1311,7 +1451,7 @@ static void pad_poll_backend(void)
     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
 
 #if PAD_BACKEND_XINPUT
-    pad_poll_xinput();
+    if (!s_pad_sdl_primary) pad_poll_xinput();   /* #326: SDL owns Xbox pads too */
     pad_merge_ext();
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
@@ -1957,7 +2097,8 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
         !sdl_rumble(port_no, param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE],
                     param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] > 1
                         ? param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL]
-                        : (u8)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] ? 255 : 0))) {
+                        : (u8)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] ? 255 : 0)) &&
+        !s_pad_sdl_primary && port_no < PAD_XINPUT_SLOTS) {
         XINPUT_VIBRATION vib;
         vib.wLeftMotorSpeed  = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257);
         vib.wRightMotorSpeed = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257);

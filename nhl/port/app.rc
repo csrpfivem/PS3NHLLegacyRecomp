@@ -5,3 +5,34 @@
 1 ICON "app.ico"
 
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+// #327: version info. Unsigned exes with none score as more suspicious in AV
+// heuristics (issue #6). Bump with each release.
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION     1,0,3,0
+ PRODUCTVERSION  1,0,3,0
+ FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+ FILEFLAGS       0
+ FILEOS          VOS_NT_WINDOWS32
+ FILETYPE        VFT_APP
+ FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "PS3NHLLegacyRecomp project"
+            VALUE "FileDescription",  "NHL Legacy Native - PS3 static recompilation runtime"
+            VALUE "FileVersion",      "1.0.3.0"
+            VALUE "InternalName",     "NHLLegacy"
+            VALUE "OriginalFilename", "NHLLegacy.exe"
+            VALUE "ProductName",      "NHL Legacy Native"
+            VALUE "ProductVersion",   "1.0.3"
+            VALUE "Comments",         "Fan-made recompilation. Contains no game data; requires your own copy of the game."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

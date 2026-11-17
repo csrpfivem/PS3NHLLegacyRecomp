@@ -1,4 +1,35 @@
+#include <windows.h>
 #include "resource.h"
+
+// #327: version info (see port/app.rc). Bump with each release.
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION     1,0,3,0
+ PRODUCTVERSION  1,0,3,0
+ FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+ FILEFLAGS       0
+ FILEOS          VOS_NT_WINDOWS32
+ FILETYPE        VFT_APP
+ FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "PS3NHLLegacyRecomp project"
+            VALUE "FileDescription",  "NHL Legacy Native launcher"
+            VALUE "FileVersion",      "1.0.3.0"
+            VALUE "InternalName",     "NHLLauncher"
+            VALUE "OriginalFilename", "NHLLauncher.exe"
+            VALUE "ProductName",      "NHL Legacy Native"
+            VALUE "ProductVersion",   "1.0.3"
+            VALUE "Comments",         "Fan-made recompilation. Contains no game data; requires your own copy of the game."
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
 
 // #317: app icon (same art as NHLLegacy.exe); ID 1 so Explorer shows it too.
 1 ICON "app.ico"

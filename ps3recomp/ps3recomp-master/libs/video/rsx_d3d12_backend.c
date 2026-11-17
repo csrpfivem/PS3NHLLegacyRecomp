@@ -1282,9 +1282,21 @@ static volatile LONG s_live_depth = 0;
 static int s_sc_on; static int s_fs; static volatile LONG s_sc_resize;
 static void sc_toggle_fullscreen(HWND hwnd);
 
+/* [NHL #327] keyboard pad fallback reads keys from THIS window's messages
+ * (cellPad.c), not a global GetAsyncKeyState poll (AV keylogger heuristic). */
+void cellPad_host_key(unsigned vk, int down, unsigned msg_time);
+void cellPad_host_keys_clear(void);
+
 static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        cellPad_host_key((unsigned)wp, 0, (unsigned)GetMessageTime());
+        break;
+    case WM_KILLFOCUS:   /* a key held while alt-tabbing must not stay down */
+        cellPad_host_keys_clear();
+        break;
     case WM_CLOSE:
         s_d3d.window_closed = 1;
         DestroyWindow(hwnd);
@@ -1325,6 +1337,7 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == VK_F10) return 0;   /* (#251: it toggled FXAA, now removed) */
         break;
     case WM_KEYDOWN:
+        cellPad_host_key((unsigned)wp, 1, (unsigned)GetMessageTime());   /* #327 */
         if (wp == VK_ESCAPE) {
             s_d3d.window_closed = 1;
             DestroyWindow(hwnd);
